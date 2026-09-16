@@ -1,0 +1,19 @@
+# Example configuration for the openspec-boss.
+# Copy to ~/.config/openspec-boss/boss.toml and adjust to taste
+# (or let 'boss' generate a file for you on first use).
+
+default = "opencode"
+
+[runners.opencode]
+kind = "opencode"
+args = []
+apply = "/opsx-apply {change}"
+
+[runners.claude]
+kind = "claude"
+args = ["--permission-mode", "bypassPermissions"]
+apply = "/opsx:apply {change}"
+
+[projects]
+shop = "~/work/shop"
+api = "~/work/api"

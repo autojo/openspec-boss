@@ -1,0 +1,11 @@
+# Editor and OS leftovers
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Planning artifacts stay local
+openspec/
+.claude/
+.opencode/

@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# boss-waiter -- detached watcher for one apply. Started via setsid by
+# 'boss dispatch' / 'boss retrigger'; survives the calling shell.
+# Usage: boss-waiter <state-file>
+
+set -u
+
+BIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=./boss-lib.sh
+. "$BIN_DIR/boss-lib.sh"
+
+state_file="${1:-}"
+if [ -z "$state_file" ] || [ ! -f "$state_file" ]; then
+  printf 'usage: boss-waiter <state-file>\n' >&2
+  exit 2
+fi
+
+change="$(jq -r '.change' "$state_file")"
+# Wait on the pane, not the name: a name follows the pane occupant and is
+# replaced by any later `agent rename`; the pane id stays stable.
+agent="$(jq -r '.pane_id // .agent' "$state_file")"
+project="$(jq -r '.project' "$state_file")"
+
+log_file="$BOSS_LOGS_DIR/$change-$(date '+%Y%m%dT%H%M%S').log"
+mkdir -p "$BOSS_LOGS_DIR" || exit 1
+BOSS_LOG_FILE="$log_file"
+log "waiter start: change=$change agent=$agent project=$project"
+
+# Record our pid so retrigger/finish can stop us.
+tmp="$(mktemp)"
+if jq --argjson pid "$$" '.waiter_pid = $pid' "$state_file" >"$tmp" 2>/dev/null; then
+  mv "$tmp" "$state_file"
+else
+  rm -f "$tmp"
+  log "waiter start: cannot update state file; continuing without pid"
+fi
+
+update_state() {
+  local st="$1" t
+  t="$(mktemp)"
+  if jq --arg st "$st" --arg at "$(now_iso)" '.last_state = $st | .last_state_at = $at' "$state_file" >"$t" 2>/dev/null; then
+    mv "$t" "$state_file"
+  else
+    rm -f "$t"
+  fi
+}
+
+# Stop the running herdr child when we get TERM (retrigger/finish).
+child_pid=""
+trap 'log "waiter terminated"; [ -n "$child_pid" ] && kill "$child_pid" 2>/dev/null; exit 0' TERM INT
+
+wait_settled() {
+  local out_file rc out code msg
+  out_file="$(mktemp)"
+  herdr agent wait "$agent" >"$out_file" 2>&1 &
+  child_pid=$!
+  wait "$child_pid"
+  rc=$?
+  child_pid=""
+  out="$(cat "$out_file")"
+  rm -f "$out_file"
+  if [ "$rc" -ne 0 ]; then
+    code="$(printf '%s' "$out" | jq -r '.error.code // "wait_failed"' 2>/dev/null || true)"
+    msg="$(printf '%s' "$out" | jq -r '.error.message // empty' 2>/dev/null || true)"
+    log "agent wait failed: $code $msg (apply agent lost?)"
+    local text
+    printf -v text 'Apply %s in %s: lost (the apply agent disappeared).\nNext step: boss status %s' "$change" "$project" "$change"
+    update_state "lost"
+    deliver "$text" "lost"
+    return 1
+  fi
+  return 0
+}
+
+# deliver <text> <state> -- prompt the boss agent; retry with growing backoff
+# while the boss is blocked; fall back to a notification when there is no boss.
+deliver() {
+  local text="$1" st="$2"
+  local attempt=1 backoff=15 start now out rc code
+  start="$(date +%s)"
+  while true; do
+    out="$(herdr agent prompt "$BOSS_AGENT_NAME" "$text" 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      log "prompt delivered to agent '$BOSS_AGENT_NAME' (state=$st, attempt=$attempt)"
+      return 0
+    fi
+    code="$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null || true)"
+    if [ "$code" = "agent_not_found" ]; then
+      log "no boss agent '$BOSS_AGENT_NAME'; showing a notification instead"
+      herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st" >/dev/null 2>&1 || true
+      return 1
+    fi
+    now="$(date +%s)"
+    if [ $(( now - start + backoff )) -gt "$BOSS_WAITER_MAX_S" ]; then
+      log "delivery retry budget exceeded (${BOSS_WAITER_MAX_S}s); giving up"
+      herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st (delivery failed)" >/dev/null 2>&1 || true
+      return 1
+    fi
+    log "delivery failed ($code); retrying in ${backoff}s"
+    sleep "$backoff"
+    attempt=$((attempt + 1))
+    backoff=$((backoff * 2))
+  done
+}
+
+main() {
+  local out st text dialog
+  while true; do
+    wait_settled || return 0
+
+    out="$(herdr agent get "$agent" 2>&1)" || {
+      log "agent get failed: $(printf '%s' "$out" | sed -n '1p')"
+      continue
+    }
+    st="$(printf '%s' "$out" | jq -r '.result.agent.agent_status // "unknown"')"
+    case "$st" in
+      idle|done|blocked) ;;
+      *)
+        log "state '$st' is not settled; waiting again"
+        continue
+        ;;
+    esac
+
+    log "settled state: $st"
+    update_state "$st"
+
+    if [ "$st" = "blocked" ]; then
+      dialog="$(herdr agent read "$agent" --source visible 2>/dev/null || true)"
+      printf -v text 'Apply %s in %s: blocked.\nVisible dialog of the apply pane:\n%s\nNext step: boss status %s' "$change" "$project" "$dialog" "$change"
+    else
+      printf -v text 'Apply %s in %s: %s. Next step: boss status %s' "$change" "$project" "$st" "$change"
+    fi
+
+    deliver "$text" "$st"
+    log "waiter end: state=$st"
+    return 0
+  done
+}
+
+main
