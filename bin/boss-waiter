@@ -49,10 +49,13 @@ update_state() {
 child_pid=""
 trap 'log "waiter terminated"; [ -n "$child_pid" ] && kill "$child_pid" 2>/dev/null; exit 0' TERM INT
 
-wait_settled() {
+# wait_for [<--until STATE>...] -- run 'herdr agent wait' on the apply pane
+# (settled states by default) as an interruptible child; on failure the agent
+# is gone: report 'lost' and return 1.
+wait_for() {
   local out_file rc out code msg
   out_file="$(mktemp)"
-  herdr agent wait "$agent" >"$out_file" 2>&1 &
+  herdr agent wait "$agent" "$@" >"$out_file" 2>&1 &
   child_pid=$!
   wait "$child_pid"
   rc=$?
@@ -106,11 +109,25 @@ deliver() {
 
 main() {
   local out st text dialog
+  local -a next_wait=()
   while true; do
-    wait_settled || return 0
+    # First round: wait for a settled state. Later rounds: wait for activity
+    # after the last report (next_wait), then for the following settled state.
+    if [ "${#next_wait[@]}" -gt 0 ]; then
+      wait_for "${next_wait[@]}" || return 0
+      out="$(herdr agent get "$agent" 2>&1)" || { log "agent get failed after activity"; continue; }
+      st="$(printf '%s' "$out" | jq -r '.result.agent.agent_status // "unknown"')"
+      log "activity after report: $st"
+      if [ "$st" = "working" ] || [ "$st" = "unknown" ]; then
+        wait_for || return 0
+      fi
+    else
+      wait_for || return 0
+    fi
 
     out="$(herdr agent get "$agent" 2>&1)" || {
       log "agent get failed: $(printf '%s' "$out" | sed -n '1p')"
+      next_wait=()
       continue
     }
     st="$(printf '%s' "$out" | jq -r '.result.agent.agent_status // "unknown"')"
@@ -118,6 +135,7 @@ main() {
       idle|done|blocked) ;;
       *)
         log "state '$st' is not settled; waiting again"
+        next_wait=()
         continue
         ;;
     esac
@@ -128,13 +146,15 @@ main() {
     if [ "$st" = "blocked" ]; then
       dialog="$(herdr agent read "$agent" --source visible 2>/dev/null || true)"
       printf -v text 'Apply %s in %s: blocked.\nVisible dialog of the apply pane:\n%s\nNext step: boss status %s' "$change" "$project" "$dialog" "$change"
+      # After an answer the agent may go straight to idle without working.
+      next_wait=(--until working --until idle --until done)
     else
       printf -v text 'Apply %s in %s: %s. Next step: boss status %s' "$change" "$project" "$st" "$change"
+      next_wait=(--until working --until blocked)
     fi
 
     deliver "$text" "$st"
-    log "waiter end: state=$st"
-    return 0
+    log "reported state=$st; staying armed for the next turn"
   done
 }
 

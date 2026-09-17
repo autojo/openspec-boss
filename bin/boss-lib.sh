@@ -103,6 +103,32 @@ apply_agent_name() {
   printf 'apply-%s-%s\n' "$head" "$hash"
 }
 
+# one_line <text> -- collapse newlines/tabs into single spaces, trim
+one_line() {
+  printf '%s' "$1" | tr '\n\r\t' '   ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
+}
+
+# with_note <apply-cmd> <note> -- the text sent to the apply agent
+with_note() {
+  if [ -n "$2" ]; then
+    printf '%s %s' "$1" "$2"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# write_state_field <state-file> <key> <string-value> -- atomic update
+write_state_field() {
+  local f="$1" k="$2" v="$3" t
+  t="$(mktemp)"
+  if jq --arg k "$k" --arg v "$v" '.[$k] = $v' "$f" >"$t" 2>/dev/null; then
+    mv "$t" "$f"
+  else
+    rm -f "$t"
+    return 1
+  fi
+}
+
 # state_file_for <project-path> <change> -- path of the state file for an apply
 state_file_for() {
   local project="$1" change="$2" hash
@@ -164,11 +190,19 @@ PY
   printf '%s' "$out" | jq -c '.result'
 }
 
+# waiter_alive <pid> -- 0 when pid is a running boss-waiter. The script runs
+# under bash, so comm= is "bash"; the command line carries the script name.
+waiter_alive() {
+  local pid="$1"
+  [ -n "$pid" ] && [ "$pid" != "null" ] || return 1
+  ps -p "$pid" -o args= 2>/dev/null | grep -q 'boss-waiter'
+}
+
 # kill_waiter <pid> -- stop a running waiter, if the pid really is a boss-waiter
 kill_waiter() {
   local pid="$1"
   [ -n "$pid" ] && [ "$pid" != "null" ] || return 0
-  if ps -p "$pid" -o comm= 2>/dev/null | grep -q 'boss-waiter'; then
+  if waiter_alive "$pid"; then
     kill "$pid" 2>/dev/null || true
     return 0
   fi

@@ -63,9 +63,10 @@ the same way in Claude Code and OpenCode.
 ## Commands
 
 ```bash
-boss dispatch <change> [--project <name|path>] [--runner <name>]
+boss dispatch <change> [--project <name|path>] [--runner <name>] [--note <text>]
 boss status [<change>] [--project <name|path>] [--json]
-boss retrigger <change> [--project <name|path>]
+boss wait <change> [--project <name|path>]
+boss retrigger <change> [--project <name|path>] [--note <text>]
 boss finish <change> [--project <name|path>] [--force]
 boss answer <change> <key>... [--project <name|path>]
 boss config-json
@@ -73,23 +74,35 @@ boss config-json
 
 - `dispatch` starts the apply in its own tab and returns a JSON object with
   agent, pane, tab and workspace. A second dispatch of the same change in the
-  same project does not start a second apply (`already_running`).
+  same project does not start a second apply (`already_running`). `--note`
+  appends free text to the apply command so the boss can hand the apply agent
+  context (what to test against, which tool to use for a check, who reviews)
+  without touching the runner template; the note is stored and reused by
+  `retrigger`.
 - `status` shows the agent state, open/done tasks from `tasks.md`,
   `git status`/`git diff --stat` of the target project and the apply tab; when
   `blocked`, it also shows the visible dialog. Without a change name, all
-  known applies are listed.
-- `retrigger` sends the apply command to the same agent again (the session
-  context is kept) and starts a new waiter.
-- `finish` closes the apply tab and cleans up – only if the change is archived
-  in the project (or with `--force`).
+  known applies are listed. `--json` carries everything Herdr knows about the
+  agent: `agent_status` (alias of `agent_state`), `pane` (`pane_id`, `tab_id`,
+  `workspace_id`, `cwd`, `focused`) and `herdr_agent` (the raw agent object,
+  `null` when the agent is gone), plus the stored `note`.
+- `wait` makes sure a waiter is armed for the apply (starts one if none is
+  alive, otherwise reports the running one). Use it after prompting the apply
+  agent directly through Herdr.
+- `retrigger` sends the apply command (with the stored or a new `--note`) to
+  the same agent again; the session context is kept and the waiter stays armed.
+- `finish` closes the apply tab, stops the waiter and drops the state. It
+  reports whether the change is archived (`archived`) but does not require it –
+  archiving stays a separate step. It refuses only while the apply agent is
+  still `working` (override with `--force`).
 - `answer` sends keys (e.g. `enter`, `esc`, `y`) to a blocked apply agent, so
   the boss can answer follow-up questions itself.
 
 All commands print JSON; errors appear as JSON on stderr with exit status 1
 (like Herdr). The tools provide thin slash commands:
-`/boss:dispatch`, `/boss:status`, `/boss:retrigger`, `/boss:finish`
-(Claude Code) or `/boss-dispatch`, `/boss-status`, `/boss-retrigger`,
-`/boss-finish` (OpenCode), which simply call the `boss` command of the same
+`/boss:dispatch`, `/boss:status`, `/boss:wait`, `/boss:retrigger`,
+`/boss:finish` (Claude Code) or `/boss-dispatch`, `/boss-status`,
+`/boss-wait`, `/boss-retrigger`, `/boss-finish` (OpenCode), which simply call the `boss` command of the same
 name.
 
 ## Configuration (`~/.config/openspec-boss/boss.toml`)

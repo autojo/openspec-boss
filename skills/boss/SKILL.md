@@ -20,13 +20,19 @@ finishes.
    Project names come from the registry in `~/.config/openspec-boss/boss.toml`
    (the `[projects]` section).
 2. **Dispatch** – once all artifacts of the change are ready:
-   `boss dispatch <change> --project <name|path> [--runner <name>]`.
-   The JSON result contains agent, pane and tab. You do not switch into the
-   apply tab; the apply agent works there on its own.
+   `boss dispatch <change> --project <name|path> [--runner <name>] [--note "<text>"]`.
+   Use `--note` to hand the apply agent context it cannot know (a real case
+   to test against, which tool to use for a check, who reviews). The JSON
+   result contains agent, pane and tab. You do not switch into the apply
+   tab; the apply agent works there on its own.
 3. **Being woken** – the waiter reports completion to you as a prompt, e.g.
    `Apply add-auth in ~/work/shop: done. Next step: boss status add-auth`. If
    the prompt arrives while you are working, it is queued – handle it after
-   the current turn.
+   the current turn. The waiter stays armed: every time the apply agent
+   returns to a settled state after being prompted again (`boss retrigger`,
+   `boss answer`, or a direct `herdr agent prompt`), you are woken again. If
+   you prompted the agent directly and are unsure a waiter is alive, run
+   `boss wait <change>`.
 4. **Review** – `boss status <change>` (or `--json`). Check:
    - all tasks in `tasks.md` checked off (`tasks.open == 0`)?
    - diff plausible? Read the changed files yourself (in the target project).
@@ -37,13 +43,17 @@ finishes.
 5. **Fix** – if the review finds problems: correct proposal/specs in the
    target project with your tool's update command (Claude Code:
    `/opsx:update <change>`, OpenCode: `/opsx-update <change>`), then
-   `boss retrigger <change>` – the apply continues in the same agent, the
-   context is kept.
-6. **Finish** – if the review passes: run `/opsx:sync <change>` or
+   `boss retrigger <change> [--note "<text>"]` – the apply continues in the
+   same agent, the context is kept, and the waiter reports the next
+   completion.
+6. **Finish** – if the review passes: `boss finish <change>` closes the
+   apply tab and cleans up; it needs the agent to be settled, nothing else.
+   Archiving is a separate decision: run `/opsx:sync <change>` or
    `/opsx-sync <change>`, or `/opsx:archive <change>` or
    `/opsx-archive <change>` in the target project (Claude Code with `:`,
-   OpenCode without), then `boss finish <change>` – this closes the apply tab
-   and cleans up.
+   OpenCode without) when the change can be archived – that may be before
+   or long after `finish`, e.g. when other changes still depend on its spec
+   deltas.
 7. **Blocked** – if the completion message is `blocked`: `boss status
    <change>` shows the visible dialog of the apply pane. Decide yourself
    whether to answer (`boss answer <change> <key>…`, e.g. `enter`, `esc`,

@@ -13,9 +13,10 @@ usage() {
 boss -- control session for OpenSpec apply cycles (see README.md)
 
 Usage:
-  boss dispatch <change> [--project <name|path>] [--runner <name>]
+  boss dispatch <change> [--project <name|path>] [--runner <name>] [--note <text>]
   boss status [<change>] [--project <name|path>] [--json]
-  boss retrigger <change> [--project <name|path>]
+  boss wait <change> [--project <name|path>]
+  boss retrigger <change> [--project <name|path>] [--note <text>]
   boss finish <change> [--project <name|path>] [--force]
   boss answer <change> <key>... [--project <name|path>]
   boss config-json
@@ -319,12 +320,13 @@ cmd_dispatch() {
   ensure_boss_name dispatch
   ensure_config
 
-  local change="" project_name="" runner_name="" arg
+  local change="" project_name="" runner_name="" note="" arg
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
       --project) project_name="${1:-}"; shift ;;
       --runner) runner_name="${1:-}"; shift ;;
+      --note) note="$(one_line "${1:-}")"; shift ;;
       -h|--help) usage ;;
       --*) usage_error "unknown option: $arg" ;;
       *) if [ -z "$change" ]; then change="$arg"; else usage_error "unexpected argument: $arg"; fi ;;
@@ -406,7 +408,7 @@ cmd_dispatch() {
   fi
 
   apply_cmd="${apply_template/\{change\}/$change}"
-  send_prompt "$agent_name" "$apply_cmd"
+  send_prompt "$agent_name" "$(with_note "$apply_cmd" "$note")"
 
   herdr_raw "pane.report_metadata" "$(jq -nc --arg p "$pane_id" --arg c "$change" \
     '{pane_id: $p, source: "openspec", tokens: {os_change: $c, os_phase: "apply"}}')" >/dev/null || exit 1
@@ -418,10 +420,10 @@ cmd_dispatch() {
   mkdir -p "$BOSS_APPLIES_DIR" || die_json "state_write" "cannot create state dir $BOSS_APPLIES_DIR"
   jq -n \
     --arg change "$change" --arg project "$project" --arg runner "$runner_name_out" \
-    --arg kind "$kind" --arg apply_cmd "$apply_cmd" --arg agent "$agent_name" \
+    --arg kind "$kind" --arg apply_cmd "$apply_cmd" --arg note "$note" --arg agent "$agent_name" \
     --arg pane_id "$pane_id" --arg tab_id "$tab_id" --arg workspace_id "$workspace_id" \
     --arg started_at "$now" --arg last_state "working" --arg last_state_at "$now" \
-    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at}' \
+    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at}' \
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"
 
   setsid -f "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1
@@ -464,10 +466,19 @@ find_state_file() {
 
 # ----------------------------------------------------------------- status ---
 
+# herdr_agent_of <target> -- the Herdr agent object as compact JSON, or empty
+herdr_agent_of() {
+  local out
+  if out="$(herdr agent get "$1" 2>&1)"; then
+    printf '%s' "$out" | jq -c '.result.agent // empty'
+  fi
+}
+
 agent_state_of() {
-  local agent="$1" out
-  if out="$(herdr agent get "$agent" 2>&1)"; then
-    printf '%s' "$out" | jq -r '.result.agent.agent_status // "unknown"'
+  local obj
+  obj="$(herdr_agent_of "$1")"
+  if [ -n "$obj" ]; then
+    printf '%s' "$obj" | jq -r '.agent_status // "unknown"'
   else
     printf 'no_agent'
   fi
@@ -485,8 +496,16 @@ status_one() {
   last_state="$(jq -r '.last_state // ""' "$state_file")"
   last_state_at="$(jq -r '.last_state_at // ""' "$state_file")"
 
-  local agent_state
-  agent_state="$(agent_state_of "$agent")"
+  local herdr_agent agent_state pane_json
+  herdr_agent="$(herdr_agent_of "$pane_id")"
+  if [ -n "$herdr_agent" ]; then
+    agent_state="$(printf '%s' "$herdr_agent" | jq -r '.agent_status // "unknown"')"
+  else
+    herdr_agent="null"
+    agent_state="no_agent"
+  fi
+  pane_json="$(jq -nc --argjson a "$herdr_agent" --arg p "$pane_id" --arg t "$tab_id" --arg w "$workspace_id" \
+    '{pane_id: ($a.pane_id // $p), tab_id: ($a.tab_id // $t), workspace_id: ($a.workspace_id // $w), cwd: ($a.cwd // null), focused: ($a.focused // null)}')"
 
   local tasks_json tasks_open tasks_done tasks_total
   if [ -f "$project/openspec/changes/$change/tasks.md" ]; then
@@ -504,7 +523,7 @@ status_one() {
 
   local dialog=""
   if [ "$agent_state" = "blocked" ]; then
-    dialog="$(herdr agent read "$agent" --source visible 2>/dev/null || true)"
+    dialog="$(herdr agent read "$pane_id" --source visible 2>/dev/null || true)"
   fi
 
   local json
@@ -513,9 +532,10 @@ status_one() {
     --arg agent_state "$agent_state" --arg pane_id "$pane_id" --arg tab_id "$tab_id" \
     --arg workspace_id "$workspace_id" --arg last_state "$last_state" --arg last_state_at "$last_state_at" \
     --argjson tasks "$tasks_json" --arg dialog "$dialog" \
+    --argjson herdr_agent "$herdr_agent" --argjson pane "$pane_json" --arg note "$(jq -r '.note // ""' "$state_file")" \
     --argjson changed_files "$(printf '%s' "$changed_files" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --argjson diff_stat "$(printf '%s' "$diff_stat" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, git: {changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end)}')"
+    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, pane: $pane, herdr_agent: $herdr_agent, note: (if $note == "" then null else $note end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, git: {changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end)}')"
 
   if [ "$json_only" -eq 1 ]; then
     printf '%s\n' "$json"
@@ -587,10 +607,30 @@ cmd_status() {
   fi
 }
 
-# --------------------------------------------------------------- retrigger ---
+# -------------------------------------------------------------------- wait ---
 
-cmd_retrigger() {
-  ensure_boss_name retrigger
+# ensure_waiter <state-file> -- start a waiter unless one is alive; prints
+# "<pid> running|started".
+ensure_waiter() {
+  local state_file="$1" pid
+  pid="$(jq -r '.waiter_pid // empty' "$state_file")"
+  if waiter_alive "$pid"; then
+    printf '%s running\n' "$pid"
+    return 0
+  fi
+  setsid -f "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1
+  # The waiter records its pid in the state file shortly after start.
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    pid="$(jq -r '.waiter_pid // empty' "$state_file")"
+    waiter_alive "$pid" && break
+    sleep 0.2
+  done
+  printf '%s started\n' "${pid:-unknown}"
+}
+
+cmd_wait() {
+  ensure_boss_name wait
   ensure_config
   local change="" project_name="" arg
   while [ $# -gt 0 ]; do
@@ -602,26 +642,57 @@ cmd_retrigger() {
       *) if [ -z "$change" ]; then change="$arg"; else usage_error "unexpected argument: $arg"; fi ;;
     esac
   done
-  [ -n "$change" ] || usage_error "usage: boss retrigger <change> [--project <name|path>]"
+  [ -n "$change" ] || usage_error "usage: boss wait <change> [--project <name|path>]"
 
-  local state_file agent apply_cmd waiter_pid out code
+  local state_file agent pane_id res
   state_file="$(find_state_file "$change" "$project_name")" || exit 1
   agent="$(jq -r '.agent' "$state_file")"
-  apply_cmd="$(jq -r '.apply_cmd' "$state_file")"
+  pane_id="$(jq -r '.pane_id' "$state_file")"
+  herdr agent get "$pane_id" >/dev/null 2>&1 || die_json "agent_gone" "agent '$agent' no longer exists; start a new apply with 'boss dispatch $change'"
+  res="$(ensure_waiter "$state_file")"
+  log "wait: change=$change agent=$agent waiter=$res"
+  printf '%s\n' "$(jq -n --arg change "$change" --arg agent "$agent" \
+    --arg pid "${res%% *}" --arg status "${res##* }" \
+    '{change: $change, agent: $agent, waiter_pid: ($pid | tonumber? // $pid), status: $status}')"
+}
 
-  if ! herdr agent get "$agent" >/dev/null 2>&1; then
+# --------------------------------------------------------------- retrigger ---
+
+cmd_retrigger() {
+  ensure_boss_name retrigger
+  ensure_config
+  local change="" project_name="" note="" note_given=0 arg
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --project) project_name="${1:-}"; shift ;;
+      --note) note="$(one_line "${1:-}")"; note_given=1; shift ;;
+      -h|--help) usage ;;
+      --*) usage_error "unknown option: $arg" ;;
+      *) if [ -z "$change" ]; then change="$arg"; else usage_error "unexpected argument: $arg"; fi ;;
+    esac
+  done
+  [ -n "$change" ] || usage_error "usage: boss retrigger <change> [--project <name|path>] [--note <text>]"
+
+  local state_file agent pane_id apply_cmd res
+  state_file="$(find_state_file "$change" "$project_name")" || exit 1
+  agent="$(jq -r '.agent' "$state_file")"
+  pane_id="$(jq -r '.pane_id' "$state_file")"
+  apply_cmd="$(jq -r '.apply_cmd' "$state_file")"
+  if [ "$note_given" -eq 1 ]; then
+    write_state_field "$state_file" note "$note"
+  else
+    note="$(jq -r '.note // ""' "$state_file")"
+  fi
+
+  if ! herdr agent get "$pane_id" >/dev/null 2>&1; then
     die_json "agent_gone" "agent '$agent' no longer exists; start a new apply with 'boss dispatch $change'"
   fi
 
-  waiter_pid="$(jq -r '.waiter_pid // empty' "$state_file")"
-  if [ -n "$waiter_pid" ] && [ "$waiter_pid" != "null" ] && kill_waiter "$waiter_pid"; then
-    log "retrigger: stopped old waiter pid $waiter_pid"
-  fi
-
-  send_prompt "$agent" "$apply_cmd"
-
-  setsid -f "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1
-  log "retrigger: change=$change agent=$agent"
+  # The waiter stays armed across turns; make sure one is alive before prompting.
+  res="$(ensure_waiter "$state_file")"
+  send_prompt "$pane_id" "$(with_note "$apply_cmd" "$note")"
+  log "retrigger: change=$change agent=$agent waiter=$res"
 
   printf '%s\n' "$(jq -n \
     --arg change "$change" --arg project "$(jq -r '.project' "$state_file")" \
@@ -647,16 +718,21 @@ cmd_finish() {
   done
   [ -n "$change" ] || usage_error "usage: boss finish <change> [--project <name|path>] [--force]"
 
-  local state_file project tab_id waiter_pid
+  local state_file project tab_id pane_id waiter_pid archived=false agent_state
   state_file="$(find_state_file "$change" "$project_name")" || exit 1
   project="$(jq -r '.project' "$state_file")"
   tab_id="$(jq -r '.tab_id' "$state_file")"
+  pane_id="$(jq -r '.pane_id' "$state_file")"
   waiter_pid="$(jq -r '.waiter_pid // empty' "$state_file")"
+  if ls -d "$project"/openspec/changes/archive/*-"$change" >/dev/null 2>&1; then
+    archived=true
+  fi
 
-  if [ "$force" -ne 1 ]; then
-    if ! ls -d "$project"/openspec/changes/archive/*-"$change" >/dev/null 2>&1; then
-      die_json "not_archived" "change '$change' is not archived in $project; archive it first (openspec archive) or use --force"
-    fi
+  # Finishing only ends the apply session; archiving stays a separate step.
+  # The one thing worth guarding is an agent that is still working.
+  agent_state="$(agent_state_of "$pane_id")"
+  if [ "$force" -ne 1 ] && [ "$agent_state" = "working" ]; then
+    die_json "agent_working" "apply agent for '$change' is still working; wait for it (boss wait $change) or use --force"
   fi
 
   if [ -n "$tab_id" ] && [ "$tab_id" != "null" ]; then
@@ -672,7 +748,8 @@ cmd_finish() {
 
   printf '%s\n' "$(jq -n \
     --arg change "$change" --arg project "$project" --arg tab_id "$tab_id" --arg status "finished" \
-    '{change: $change, project: $project, tab_id: $tab_id, status: $status}')"
+    --argjson archived "$archived" \
+    '{change: $change, project: $project, tab_id: $tab_id, archived: $archived, status: $status}')"
 }
 
 # ------------------------------------------------------------------ answer ---
@@ -694,11 +771,13 @@ cmd_answer() {
   [ -n "$change" ] || usage_error "usage: boss answer <change> <key>... [--project <name|path>]"
   [ "${#keys[@]}" -gt 0 ] || usage_error "usage: boss answer <change> <key>... [--project <name|path>]"
 
-  local state_file agent out code
+  local state_file agent pane_id out code
   state_file="$(find_state_file "$change" "$project_name")" || exit 1
   agent="$(jq -r '.agent' "$state_file")"
+  pane_id="$(jq -r '.pane_id' "$state_file")"
 
-  if ! out="$(herdr agent send-keys "$agent" "${keys[@]}" 2>&1)"; then
+  ensure_waiter "$state_file" >/dev/null
+  if ! out="$(herdr agent send-keys "$pane_id" "${keys[@]}" 2>&1)"; then
     code="$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null || true)"
     die_json "send_keys_failed" "sending keys to $agent failed: $code"
   fi
@@ -717,6 +796,7 @@ main() {
     config-json) shift; config_json "$@" ;;
     dispatch) shift; cmd_dispatch "$@" ;;
     status) shift; cmd_status "$@" ;;
+    wait) shift; cmd_wait "$@" ;;
     retrigger) shift; cmd_retrigger "$@" ;;
     finish) shift; cmd_finish "$@" ;;
     answer) shift; cmd_answer "$@" ;;
