@@ -168,13 +168,18 @@ the target locations are reported, never overwritten. Remove again with
 - **State files**: `~/.local/state/openspec-boss/applies/` – one file per
   apply with agent, tab, pane and waiter PID; `boss status` without a change
   lists them.
-- **Agent stuck?** `herdr agent get apply-<change>` shows the state,
-  `herdr agent read apply-<change> --source visible` the visible dialog.
+- **Agent stuck?** Read the agent name from `boss status <change> --json`
+  (field `agent`; long change names are shortened to `apply-<prefix>-<hash>`
+  because Herdr limits names to 32 characters), then `herdr agent get <name>`
+  shows the state and `herdr agent read <name> --source visible` the dialog.
+- **Dispatch failed?** The tab is closed again and the error JSON carries the
+  pane's last visible lines as `pane_tail`; set `BOSS_KEEP_FAILED_TAB=1` to
+  keep the tab for inspection.
 - **No waking?** Check whether an agent `boss` exists (`herdr agent list`)
   and whether the Herdr integration of the runner is installed
   (`herdr integration status`).
 - **`boss dispatch` reports `already_running`?** A pane with the tokens
-  `os_change`/`os_phase=apply` or an agent `apply-<change>` already exists in
+  `os_change`/`os_phase=apply` or the change's apply agent already exists in
   the target project for this change – `boss status` shows it.
 - **Waiter after a Herdr restart?** The waiter reports `lost` via prompt or
   notification and exits; `boss finish --force` cleans up the state.

@@ -169,8 +169,14 @@ resolve_project() {
       fi
     fi
   fi
+  local given="$project"
   project="$(canonical_path "$project")"
-  [ -d "$project/openspec/changes" ] || die_json "project_invalid" "'$project' is not an OpenSpec project (missing openspec/changes)"
+  if [ ! -d "$project/openspec/changes" ]; then
+    if [ -n "$name" ] && [ "$given" != "$name" ]; then
+      die_json "project_invalid" "project '$name' -> '$given' -> '$project' is not an OpenSpec project (missing openspec/changes)"
+    fi
+    die_json "project_invalid" "'$given' -> '$project' is not an OpenSpec project (missing openspec/changes)"
+  fi
   printf '%s\n' "$project"
 }
 
@@ -275,7 +281,7 @@ find_running_apply() {
   if [ -z "$hit" ] || [ "$hit" = "null" ]; then
     agents="$(herdr_json agent list)" || exit 1
     hit="$(printf '%s' "$agents" | jq -c \
-      --arg n "apply-$(normalize_name "$change")" --arg p "$project" --arg ps "$project/" \
+      --arg n "$(apply_agent_name "$change")" --arg p "$project" --arg ps "$project/" \
       '[.agents[] | select(.name == $n and (((.cwd // "") == $p) or (((.cwd // "") | startswith($ps)))))
         | {pane_id, tab_id, workspace_id}] | .[0] // empty')"
   fi
@@ -360,11 +366,15 @@ cmd_dispatch() {
   pane_id="$(printf '%s' "$created" | jq -r '.root_pane.pane_id // empty')"
   tab_id="$(printf '%s' "$created" | jq -r '.tab.tab_id // .root_pane.tab_id // empty')"
   [ -n "$pane_id" ] && [ -n "$tab_id" ] || die_json "tab_create_failed" "herdr tab create returned no pane/tab for $project"
+  # From here on a failure must not leave the tab behind (see die_json).
+  BOSS_FAILED_TAB="$tab_id"
+  BOSS_FAILED_PANE="$pane_id"
 
   # Start the agent, retrying while the fresh shell pane is still busy.
-  local started=0 deadline out rc code
+  local started=0 deadline out rc code=""
   deadline=$(( $(date +%s%3N) + BOSS_AGENT_BUSY_RETRY_MS ))
-  while [ "$(date +%s%3N)" -lt "$deadline" ]; do
+  # Always try at least once, then keep retrying busy panes until the deadline.
+  while :; do
     if [ "${#agent_args[@]}" -gt 0 ]; then
       out="$(herdr agent start "$agent_name" --kind "$kind" --pane "$pane_id" --timeout "$BOSS_AGENT_START_TIMEOUT_MS" -- "${agent_args[@]}" 2>&1)"
     else
@@ -377,6 +387,7 @@ cmd_dispatch() {
     fi
     code="$(printf '%s' "$out" | jq -r '.error.code // ""' 2>/dev/null || true)"
     [ "$code" = "agent_pane_busy" ] || break
+    [ "$(date +%s%3N)" -lt "$deadline" ] || break
     log "agent start for $agent_name hit a busy pane; retrying"
     sleep 1
   done
@@ -385,13 +396,13 @@ cmd_dispatch() {
     if [ -n "$code" ] && [ "$code" != "agent_pane_busy" ]; then
       msg="agent '$agent_name' failed to start: $code"
     fi
-    die_json "agent_not_ready" "$msg (pane $pane_id, tab $tab_id)"
+    die_json "agent_not_ready" "$msg (pane $pane_id, tab $tab_id closed)"
   fi
 
   # Wait until the agent TUI is rendered before prompting.
   if ! out="$(herdr agent wait "$agent_name" --until idle --timeout 60000 2>&1)"; then
     code="$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null || true)"
-    die_json "agent_not_ready" "agent '$agent_name' not ready before prompting ($code; pane $pane_id, tab $tab_id)"
+    die_json "agent_not_ready" "agent '$agent_name' not ready before prompting ($code; pane $pane_id, tab $tab_id closed)"
   fi
 
   apply_cmd="${apply_template/\{change\}/$change}"
@@ -414,6 +425,7 @@ cmd_dispatch() {
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"
 
   setsid -f "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1
+  BOSS_FAILED_TAB=""
 
   log "dispatch: change=$change project=$project runner=$runner_name_out agent=$agent_name tab=$tab_id pane=$pane_id workspace=$workspace_id"
 

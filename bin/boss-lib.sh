@@ -33,10 +33,25 @@ log() {
   fi
 }
 
-# die_json <code> <message> -- error JSON on stderr, exit 1
+# die_json <code> <message> -- error JSON on stderr, exit 1.
+# When BOSS_FAILED_TAB/BOSS_FAILED_PANE are set (dispatch after tab create),
+# the tab is closed again and the pane's last visible lines are attached as
+# pane_tail, unless BOSS_KEEP_FAILED_TAB=1.
 die_json() {
-  local code="$1" msg="$2"
-  printf '{"error":"%s","message":"%s"}\n' "$code" "$msg" >&2
+  local code="$1" msg="$2" tail_json="null"
+  if [ -n "${BOSS_FAILED_TAB:-}" ]; then
+    local tail
+    tail="$(herdr pane read "${BOSS_FAILED_PANE:-}" --source visible --lines 15 2>/dev/null \
+      | grep -v '^[[:space:]]*$' | tail -n 15 || true)"
+    tail_json="$(printf '%s' "$tail" | jq -Rs . 2>/dev/null || printf 'null')"
+    if [ "${BOSS_KEEP_FAILED_TAB:-0}" != "1" ]; then
+      herdr tab close "$BOSS_FAILED_TAB" >/dev/null 2>&1 || true
+      log "closed tab $BOSS_FAILED_TAB after failed dispatch ($code)"
+    fi
+    BOSS_FAILED_TAB=""
+  fi
+  jq -nc --arg code "$code" --arg msg "$msg" --argjson tail "$tail_json" \
+    '{error: $code, message: $msg} + (if $tail == null then {} else {pane_tail: $tail} end)' >&2
   exit 1
 }
 
@@ -71,9 +86,21 @@ normalize_name() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9_-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//'
 }
 
-# apply_agent_name <change> -- "apply-<change>", normalized for herdr
+# apply_agent_name <change> -- herdr agent name for a change's apply.
+# Herdr allows [a-z][a-z0-9_-]{0,31}; "apply-<change>" is used when it fits,
+# otherwise "apply-" + the first 19 characters + "-" + 6 hex of sha1(change)
+# so two long names with the same beginning still differ.
 apply_agent_name() {
-  printf 'apply-%s\n' "$(normalize_name "$1")"
+  local norm full head hash
+  norm="$(normalize_name "$1")"
+  full="apply-$norm"
+  if [ "${#full}" -le 32 ]; then
+    printf '%s\n' "$full"
+    return 0
+  fi
+  head="$(printf '%s' "$norm" | cut -c1-19 | sed -e 's/[-_]*$//')"
+  hash="$(printf '%s' "$norm" | sha1sum | cut -c1-6)"
+  printf 'apply-%s-%s\n' "$head" "$hash"
 }
 
 # state_file_for <project-path> <change> -- path of the state file for an apply
@@ -87,16 +114,18 @@ state_file_for() {
 expand_home() {
   case "$1" in
     "~") printf '%s' "$HOME" ;;
-    "~/"*) printf '%s%s' "$HOME" "${1#\~/}" ;;
+    "~/"*) printf '%s/%s' "$HOME" "${1#\~/}" ;;
     *) printf '%s' "$1" ;;
   esac
 }
 
-# canonical_path <path> -- absolute, resolved path (no symlink components)
+# canonical_path <path> -- absolute, resolved path (no symlink components).
+# A path that does not exist is returned expanded but unresolved, so error
+# messages can still show it.
 canonical_path() {
   local p
   p="$(expand_home "$1")"
-  (cd "$p" 2>/dev/null && pwd) || printf '%s' "$(readlink -f "$p")"
+  (cd "$p" 2>/dev/null && pwd) || readlink -f "$p" 2>/dev/null || printf '%s' "$p"
 }
 
 # herdr_raw <method> <params-json> -- call the Herdr socket API directly.
