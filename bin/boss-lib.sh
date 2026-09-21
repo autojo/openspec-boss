@@ -10,6 +10,7 @@ BOSS_STATE_DIR="${BOSS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/openspec
 BOSS_APPLIES_DIR="$BOSS_STATE_DIR/applies"
 BOSS_LOGS_DIR="$BOSS_STATE_DIR/logs"
 BOSS_CYCLES_DIR="$BOSS_STATE_DIR/cycles"
+BOSS_BOSSES_DIR="$BOSS_STATE_DIR/bosses"
 
 # --- Tunables ---
 BOSS_AGENT_NAME="${BOSS_AGENT_NAME:-boss}"
@@ -108,6 +109,96 @@ apply_agent_name() {
   head="$(printf '%s' "$norm" | cut -c1-19 | sed -e 's/[-_]*$//')"
   hash="$(printf '%s' "$norm" | sha1sum | cut -c1-6)"
   printf 'apply-%s-%s\n' "$head" "$hash"
+}
+
+# boss_registry_file_for <workspace-id> -- registry file for the workspace's boss
+boss_registry_file_for() {
+  printf '%s/%s.json\n' "$BOSS_BOSSES_DIR" "$(normalize_name "$1")"
+}
+
+# boss_name_for <workspace-id> -- default herdr agent name of a workspace boss.
+# Herdr allows [a-z][a-z0-9_-]{0,31}; "boss-<workspace>" is used when it fits,
+# otherwise "boss-" + the first 19 characters + "-" + 6 hex of sha1(workspace)
+# so two long ids with the same beginning still differ.
+boss_name_for() {
+  local norm full head hash
+  norm="$(normalize_name "$1")"
+  full="boss-$norm"
+  if [ "${#full}" -le 32 ]; then
+    printf '%s\n' "$full"
+    return 0
+  fi
+  head="$(printf '%s' "$norm" | cut -c1-19 | sed -e 's/[-_]*$//')"
+  hash="$(printf '%s' "$norm" | sha1sum | cut -c1-6)"
+  printf 'boss-%s-%s\n' "$head" "$hash"
+}
+
+# boss_agents -- compact '.agents' array from 'herdr agent list', or '[]' when
+# Herdr is unavailable. Tolerant on purpose: callers use it only for liveness.
+boss_agents() {
+  local out
+  out="$(herdr agent list 2>/dev/null || true)"
+  printf '%s' "$out" | jq -c '.result.agents // .agents // []' 2>/dev/null || printf '[]'
+}
+
+# boss_agent_alive_name <agents-json> <name> -- 0 when an agent has that name
+boss_agent_alive_name() {
+  printf '%s' "$1" | jq -e --arg n "$2" \
+    'map(select(type == "object" and .name == $n)) | length > 0' >/dev/null 2>&1
+}
+
+# boss_agent_alive_pane <agents-json> <pane-id> -- 0 when an agent sits on that pane
+boss_agent_alive_pane() {
+  printf '%s' "$1" | jq -e --arg p "$2" \
+    'map(select(type == "object" and .pane_id == $p)) | length > 0' >/dev/null 2>&1
+}
+
+# boss_write_registry <file> <workspace-id> <pane-id> <agent> -- write the entry
+boss_write_registry() {
+  local file="$1" workspace_id="$2" pane_id="$3" agent="$4"
+  mkdir -p "$BOSS_BOSSES_DIR" || die_json "state_write" "cannot create boss registry dir $BOSS_BOSSES_DIR"
+  jq -n --arg w "$workspace_id" --arg p "$pane_id" --arg a "$agent" --arg t "$(now_iso)" \
+    '{workspace_id: $w, pane_id: $p, agent: $a, claimed_at: $t}' >"$file" \
+    || die_json "state_write" "cannot write boss registry $file"
+}
+
+# boss_agent_name <workspace-id> -- registered agent of the workspace's boss, or empty
+boss_agent_name() {
+  local reg
+  [ -n "${1:-}" ] || return 0
+  reg="$(boss_registry_file_for "$1")"
+  [ -f "$reg" ] || return 0
+  jq -r '.agent // empty' "$reg" 2>/dev/null || true
+}
+
+# boss_resolve_agent <state-file> -- agent name of the boss responsible for an
+# apply, in this order: (1) the boss registered for the apply's workspace,
+# (2) the dispatcher boss recorded in the state, (3) the global BOSS_AGENT_NAME.
+# Dead entries are skipped; prints nothing when no boss is reachable.
+boss_resolve_agent() {
+  local state_file="$1" agents ws reg reg_agent reg_pane state_boss
+  agents="$(boss_agents)"
+  ws="$(jq -r '.workspace_id // empty' "$state_file" 2>/dev/null || true)"
+  if [ -n "$ws" ]; then
+    reg="$(boss_registry_file_for "$ws")"
+    if [ -f "$reg" ]; then
+      reg_agent="$(jq -r '.agent // empty' "$reg" 2>/dev/null || true)"
+      reg_pane="$(jq -r '.pane_id // empty' "$reg" 2>/dev/null || true)"
+      if [ -n "$reg_agent" ] && boss_agent_alive_pane "$agents" "$reg_pane"; then
+        printf '%s' "$reg_agent"
+        return 0
+      fi
+    fi
+  fi
+  state_boss="$(jq -r '.boss // empty' "$state_file" 2>/dev/null || true)"
+  if [ -n "$state_boss" ] && boss_agent_alive_name "$agents" "$state_boss"; then
+    printf '%s' "$state_boss"
+    return 0
+  fi
+  if [ -n "${BOSS_AGENT_NAME:-}" ] && boss_agent_alive_name "$agents" "$BOSS_AGENT_NAME"; then
+    printf '%s' "$BOSS_AGENT_NAME"
+    return 0
+  fi
 }
 
 # one_line <text> -- collapse newlines/tabs into single spaces, trim

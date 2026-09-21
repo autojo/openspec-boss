@@ -10,7 +10,7 @@ can be transferred to other servers.
 ## How it fits together
 
 ```
-  human <-----> boss session (claude | opencode), Herdr agent "boss"
+  human <-----> boss session (claude | opencode), Herdr agent "boss-<workspace>"
                     |
                     |  /opsx:explore, /opsx:propose  (in the target project via cd)
                     |
@@ -41,8 +41,8 @@ can be transferred to other servers.
           | working ... done | blocked                                |
           +--------------------------------------------------------->+
                                                                      |
-                                       herdr agent prompt boss "Apply add-auth in ~/work/shop: done.
-                                                                Next step: boss status add-auth"
+                                        herdr agent prompt <responsible boss> "Apply add-auth in
+                                                     ~/work/shop: done. Next step: boss status add-auth"
                                                                      |
     boss session  <--------------------------------------------------+
        |
@@ -60,6 +60,15 @@ that waits for the apply agent's state (`done`, `idle` or `blocked`) and
 writes the result into the boss session as a prompt. That makes waking work
 the same way in Claude Code and OpenCode.
 
+The boss is scoped to its Herdr workspace: `boss claim` makes a pane the boss
+of its workspace, and `dispatch`/`retrigger`/`finish`/`answer` claim a free
+workspace automatically (or abort when another living pane owns it). Several
+workspaces can run their own boss in parallel. When an apply settles, the waiter
+resolves the responsible boss in this order: (1) the boss registered for the
+workspace the apply runs in, (2) the boss that dispatched the apply (stored in
+the state), (3) the global `BOSS_AGENT_NAME` (default `boss`). Dead agents are
+skipped; when none is reachable, the waiter shows a Herdr notification instead.
+
 ## Commands
 
 ```bash
@@ -70,6 +79,7 @@ boss wait <change> [--project <name|path>]
 boss retrigger <change> [--project <name|path>] [--note <text>]
 boss finish <change> [--project <name|path>] [--force]
 boss answer <change> <key>... [--project <name|path>]
+boss claim [--name <name>] [--release]
 boss config-json
 ```
 
@@ -106,12 +116,18 @@ boss config-json
   still `working` (override with `--force`).
 - `answer` sends keys (e.g. `enter`, `esc`, `y`) to a blocked apply agent, so
   the boss can answer follow-up questions itself.
+- `claim` makes the current pane the boss of its Herdr workspace and returns
+  `{workspace_id, pane_id, agent, status}` (`claimed`, `already_claimed` or
+  `released`). `--name` overrides the derived agent name `boss-<workspace>`;
+  `--release` removes the entry again. There is at most one living boss per
+  workspace, but different workspaces can each have one.
 
 All commands print JSON; errors appear as JSON on stderr with exit status 1
 (like Herdr). The tools provide thin slash commands:
 `/boss:dispatch`, `/boss:status`, `/boss:wait`, `/boss:retrigger`,
-`/boss:finish` (Claude Code) or `/boss-dispatch`, `/boss-status`,
-`/boss-wait`, `/boss-retrigger`, `/boss-finish` (OpenCode), which simply call the `boss` command of the same
+`/boss:finish`, `/boss:claim` (Claude Code) or `/boss-dispatch`,
+`/boss-status`, `/boss-wait`, `/boss-retrigger`, `/boss-finish`,
+`/boss-claim` (OpenCode), which simply call the `boss` command of the same
 name.
 
 ## Configuration (`~/.config/openspec-boss/boss.toml`)
@@ -190,8 +206,9 @@ the target locations are reported, never overwritten. Remove again with
    or OpenCode there. For Claude Code, `claude --add-dir <project>…` is
    recommended so that file access to the target projects does not trigger
    permission prompts (or keep the projects in a common parent directory).
-2. The first `boss` call registers the session as the Herdr agent `boss`
-   (only one boss session at a time) and generates `boss.toml`.
+2. `boss claim` (or the first `boss dispatch`/`retrigger`/`finish`/`answer`)
+   registers the session as the boss of its Herdr workspace and generates
+   `boss.toml`. Use a workspace per project for independent bosses.
 3. Plan, dispatch, review changes – as described in the `boss` skill.
 
 ## Troubleshooting
@@ -200,8 +217,12 @@ the target locations are reported, never overwritten. Remove again with
   records the start, the detected state, every delivery attempt and the end
   of the waiter.
 - **State files**: `~/.local/state/openspec-boss/applies/` – one file per
-  apply with agent, tab, pane and waiter PID; `boss status` without a change
-  lists them.
+  apply with agent, tab, pane, waiter PID and the dispatching boss; `boss
+  status` without a change lists them.
+- **Boss registry**: `~/.local/state/openspec-boss/bosses/` – one JSON file per
+  workspace with `workspace_id`, `pane_id`, `agent` and `claimed_at`, written by
+  `boss claim`. The waiter reads it to find the responsible boss; agents that no
+  longer exist are skipped.
 - **Event logs**: `~/.local/state/openspec-boss/cycles/` – one append-only
   `*.events.jsonl` per change and project, recording `dispatch`, `retrigger`,
   `settled`, `blocked`, `lost`, `finish` and an aggregated `cycle` record.
@@ -214,11 +235,17 @@ the target locations are reported, never overwritten. Remove again with
 - **Dispatch failed?** The tab is closed again and the error JSON carries the
   pane's last visible lines as `pane_tail`; set `BOSS_KEEP_FAILED_TAB=1` to
   keep the tab for inspection.
-- **No waking?** Check whether an agent `boss` exists (`herdr agent list`)
-  and whether the Herdr integration of the runner is installed
-  (`herdr integration status`). An apply that sits in its own wait loop stays
-  `working` and is never a settled state, so the waiter stays silent; the
-  yield instruction prevents that, and `BOSS_WAITER_STALL_MS` surfaces it.
+- **No waking?** The waiter resolves the responsible boss via the workspace
+  registry, the recorded dispatcher boss and finally the global `BOSS_AGENT_NAME`
+  (default `boss`). Check `herdr agent list` for that name and that the Herdr
+  integration of the runner is installed (`herdr integration status`). An apply
+  that sits in its own wait loop stays `working` and is never a settled state,
+  so the waiter stays silent; the yield instruction prevents that, and
+  `BOSS_WAITER_STALL_MS` surfaces it.
+- **No boss reachable?** If none of the three candidates is alive, the waiter
+  cannot prompt anyone: it shows a Herdr notification naming the apply instead.
+  Claim a boss for the apply's workspace (`boss claim`) or start a global
+  `boss`, then use the notification and `boss status` to continue.
 - **`boss dispatch` reports `already_running`?** A pane with the tokens
   `os_change`/`os_phase=apply` or the change's apply agent already exists in
   the target project for this change – `boss status` shows it.

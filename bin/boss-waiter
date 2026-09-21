@@ -104,22 +104,29 @@ wait_for() {
   done
 }
 
-# deliver <text> <state> -- prompt the boss agent; retry with growing backoff
-# while the boss is blocked; fall back to a notification when there is no boss.
+# deliver <text> <state> -- prompt the responsible boss agent; retry with
+# growing backoff while the boss is blocked; fall back to a notification when
+# no boss is reachable.
 deliver() {
   local text="$1" st="$2"
-  local attempt=1 backoff=15 start now out rc code
+  local boss attempt=1 backoff=15 start now out rc code
+  boss="$(boss_resolve_agent "$state_file")"
+  if [ -z "$boss" ]; then
+    log "no boss agent reachable (workspace/dispatcher/global); showing a notification instead"
+    herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st" >/dev/null 2>&1 || true
+    return 1
+  fi
   start="$(date +%s)"
   while true; do
-    out="$(herdr agent prompt "$BOSS_AGENT_NAME" "$text" 2>&1)"
+    out="$(herdr agent prompt "$boss" "$text" 2>&1)"
     rc=$?
     if [ "$rc" -eq 0 ]; then
-      log "prompt delivered to agent '$BOSS_AGENT_NAME' (state=$st, attempt=$attempt)"
+      log "prompt delivered to agent '$boss' (state=$st, attempt=$attempt)"
       return 0
     fi
     code="$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null || true)"
     if [ "$code" = "agent_not_found" ]; then
-      log "no boss agent '$BOSS_AGENT_NAME'; showing a notification instead"
+      log "no boss agent '$boss'; showing a notification instead"
       herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st" >/dev/null 2>&1 || true
       return 1
     fi

@@ -20,6 +20,7 @@ Usage:
   boss retrigger <change> [--project <name|path>] [--note <text>]
   boss finish <change> [--project <name|path>] [--force]
   boss answer <change> <key>... [--project <name|path>]
+  boss claim [--name <name>] [--release]
   boss config-json
   boss --help
 EOF
@@ -190,11 +191,97 @@ resolve_project() {
   printf '%s\n' "$project"
 }
 
-# ------------------------------------------------------- boss identity (D4) ---
+# ------------------------------------------------------- boss identity (D5) ---
 
-# ensure_boss_name <mode> -- register the calling pane as Herdr agent
-# $BOSS_AGENT_NAME unless the name is already taken by another pane.
-ensure_boss_name() {
+# cmd_claim [--name <name>] [--release] -- register (or release) this pane as
+# the boss of its Herdr workspace and keep one registry entry per workspace.
+cmd_claim() {
+  local name="" want_release=0 arg
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --name) name="${1:-}"; shift ;;
+      --release) want_release=1 ;;
+      -h|--help) usage ;;
+      --*) usage_error "unknown option: $arg" ;;
+      *) usage_error "unexpected argument: $arg" ;;
+    esac
+  done
+
+  if [ "${HERDR_ENV:-}" != "1" ]; then
+    die_json "not_in_herdr" "boss claim requires a Herdr pane (HERDR_ENV is not set); run the boss session inside Herdr"
+  fi
+  local pane_id workspace_id
+  pane_id="${HERDR_PANE_ID:-}"
+  workspace_id="${HERDR_WORKSPACE_ID:-}"
+  [ -n "$pane_id" ] || die_json "not_in_herdr" "HERDR_PANE_ID is not set; cannot claim the boss role"
+  [ -n "$workspace_id" ] || die_json "not_in_herdr" "HERDR_WORKSPACE_ID is not set; cannot claim the boss role"
+
+  local reg
+  reg="$(boss_registry_file_for "$workspace_id")"
+
+  if [ "$want_release" -eq 1 ]; then
+    local reg_pane
+    reg_pane="$(jq -r '.pane_id // empty' "$reg" 2>/dev/null || true)"
+    if [ -z "$reg_pane" ] || [ "$reg_pane" != "$pane_id" ]; then
+      die_json "not_boss" "this pane ($pane_id) is not the boss of workspace $workspace_id"
+    fi
+    rm -f "$reg"
+    log "released boss claim for workspace $workspace_id (pane $pane_id)"
+    printf '%s\n' "$(jq -n --arg w "$workspace_id" --arg p "$pane_id" \
+      '{workspace_id: $w, pane_id: $p, status: "released"}')"
+    return 0
+  fi
+
+  if [ -z "$name" ]; then
+    name="$(boss_name_for "$workspace_id")"
+  else
+    name="$(normalize_name "$name")"
+    [ -n "$name" ] || usage_error "--name must contain a usable name (letters, digits, - or _)"
+  fi
+
+  local agents reg_pane reg_agent
+  agents="$(boss_agents)"
+  if [ -f "$reg" ]; then
+    reg_pane="$(jq -r '.pane_id // empty' "$reg" 2>/dev/null || true)"
+    reg_agent="$(jq -r '.agent // empty' "$reg" 2>/dev/null || true)"
+    if [ -n "$reg_pane" ]; then
+      if [ "$reg_pane" = "$pane_id" ]; then
+        if [ -n "$reg_agent" ] && [ "$name" != "$reg_agent" ]; then
+          herdr_json agent rename "$pane_id" "$name" >/dev/null || exit 1
+          boss_write_registry "$reg" "$workspace_id" "$pane_id" "$name"
+          reg_agent="$name"
+        fi
+        printf '%s\n' "$(jq -n --arg w "$workspace_id" --arg p "$pane_id" --arg a "$reg_agent" \
+          '{workspace_id: $w, pane_id: $p, agent: $a, status: "already_claimed"}')"
+        return 0
+      fi
+      if boss_agent_alive_pane "$agents" "$reg_pane"; then
+        die_json "boss_exists" "workspace $workspace_id already has a boss on pane $reg_pane (agent ${reg_agent:-unknown})"
+      fi
+    fi
+  fi
+
+  local owner
+  owner="$(printf '%s' "$agents" | jq -r --arg n "$name" \
+    'map(select(type == "object" and .name == $n)) | .[0].pane_id // empty')"
+  if [ -n "$owner" ] && [ "$owner" != "$pane_id" ]; then
+    die_json "boss_exists" "agent '$name' already belongs to pane $owner; choose another name with --name"
+  fi
+
+  herdr_json agent rename "$pane_id" "$name" >/dev/null || exit 1
+  boss_write_registry "$reg" "$workspace_id" "$pane_id" "$name"
+  log "claimed boss of workspace $workspace_id as agent '$name' (pane $pane_id)"
+  printf '%s\n' "$(jq -n --arg w "$workspace_id" --arg p "$pane_id" --arg a "$name" \
+    '{workspace_id: $w, pane_id: $p, agent: $a, status: "claimed"}')"
+}
+
+# ensure_boss_claim <mode> -- make sure the calling pane is the boss of its
+# Herdr workspace. The writing commands (dispatch/retrigger/finish/answer)
+# claim a free workspace automatically and abort when another living pane owns
+# it. Read-only modes (status/wait/review) never claim and never abort for a
+# foreign boss.
+ensure_boss_claim() {
   local mode="${1:-status}"
   if [ "${HERDR_ENV:-}" != "1" ]; then
     case "$mode" in
@@ -208,22 +295,53 @@ ensure_boss_name() {
     return 0
   fi
 
-  local pane_id
+  local pane_id workspace_id reg reg_pane reg_agent agents
   pane_id="${HERDR_PANE_ID:-}"
-  [ -n "$pane_id" ] || die_json "not_in_herdr" "HERDR_PANE_ID is not set; cannot register the boss agent"
+  workspace_id="${HERDR_WORKSPACE_ID:-}"
+  [ -n "$pane_id" ] || die_json "not_in_herdr" "HERDR_PANE_ID is not set; cannot establish the boss identity"
+  [ -n "$workspace_id" ] || die_json "not_in_herdr" "HERDR_WORKSPACE_ID is not set; cannot establish the boss identity"
 
-  local agents owner
-  agents="$(herdr_json agent list)" || exit 1
-  owner="$(printf '%s' "$agents" | jq -r --arg n "$BOSS_AGENT_NAME" '.agents[]? | select(.name == $n) | .pane_id' | sed -n '1p')"
-  if [ -n "$owner" ]; then
-    if [ "$owner" = "$pane_id" ]; then
-      return 0
+  agents=""
+  reg="$(boss_registry_file_for "$workspace_id")"
+  if [ -f "$reg" ]; then
+    reg_pane="$(jq -r '.pane_id // empty' "$reg" 2>/dev/null || true)"
+    reg_agent="$(jq -r '.agent // empty' "$reg" 2>/dev/null || true)"
+    if [ -n "$reg_pane" ]; then
+      if [ "$reg_pane" = "$pane_id" ]; then
+        return 0
+      fi
+      agents="$(boss_agents)"
+      if boss_agent_alive_pane "$agents" "$reg_pane"; then
+        case "$mode" in
+          dispatch|retrigger|finish|answer)
+            die_json "boss_exists" "workspace $workspace_id already has a boss on pane $reg_pane (agent ${reg_agent:-unknown}); run boss commands there"
+            ;;
+          *)
+            log "warning: workspace $workspace_id belongs to boss pane $reg_pane; continuing read-only"
+            ;;
+        esac
+        return 0
+      fi
     fi
-    die_json "boss_exists" "agent '$BOSS_AGENT_NAME' already belongs to pane $owner; only one boss session at a time"
   fi
 
-  herdr_json agent rename "$pane_id" "$BOSS_AGENT_NAME" >/dev/null || exit 1
-  log "registered this pane as Herdr agent '$BOSS_AGENT_NAME'"
+  case "$mode" in
+    dispatch|retrigger|finish|answer) ;;
+    *) return 0 ;;
+  esac
+
+  local name owner
+  name="$(boss_name_for "$workspace_id")"
+  [ -n "$agents" ] || agents="$(boss_agents)"
+  owner="$(printf '%s' "$agents" | jq -r --arg n "$name" \
+    'map(select(type == "object" and .name == $n)) | .[0].pane_id // empty')"
+  if [ -n "$owner" ] && [ "$owner" != "$pane_id" ]; then
+    die_json "boss_exists" "agent '$name' already belongs to pane $owner; claim a name with 'boss claim --name'"
+  fi
+  herdr_json agent rename "$pane_id" "$name" >/dev/null || exit 1
+  boss_write_registry "$reg" "$workspace_id" "$pane_id" "$name"
+  log "auto-claimed boss of workspace $workspace_id as agent '$name' (pane $pane_id)"
+  return 0
 }
 
 # ------------------------------------------------------ workspace mapping ---
@@ -326,8 +444,12 @@ send_prompt() {
 # ---------------------------------------------------------------- dispatch ---
 
 cmd_dispatch() {
-  ensure_boss_name dispatch
+  ensure_boss_claim dispatch
   ensure_config
+  # The dispatcher boss is recorded in the apply state so the waiter can wake
+  # it even when the apply runs in a different workspace.
+  local dispatcher_boss
+  dispatcher_boss="$(boss_agent_name "${HERDR_WORKSPACE_ID:-}")"
 
   local change="" project_name="" runner_name="" note="" arg
   while [ $# -gt 0 ]; do
@@ -432,9 +554,9 @@ cmd_dispatch() {
   jq -n \
     --arg change "$change" --arg project "$project" --arg runner "$runner_name_out" \
     --arg kind "$kind" --arg apply_cmd "$apply_cmd" --arg note "$note" --arg yield "$runner_yield" --arg agent "$agent_name" \
-    --arg pane_id "$pane_id" --arg tab_id "$tab_id" --arg workspace_id "$workspace_id" \
+    --arg pane_id "$pane_id" --arg tab_id "$tab_id" --arg workspace_id "$workspace_id" --arg boss "$dispatcher_boss" \
     --arg started_at "$now" --arg last_state "working" --arg last_state_at "$now" \
-    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at}' \
+    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, boss: $boss, waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at}' \
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"
 
   setsid -f "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1
@@ -602,7 +724,7 @@ status_all() {
 }
 
 cmd_status() {
-  ensure_boss_name status
+  ensure_boss_claim status
   ensure_config
   local json_only=0 change="" project_name="" arg
   while [ $# -gt 0 ]; do
@@ -846,7 +968,7 @@ ensure_waiter() {
 }
 
 cmd_wait() {
-  ensure_boss_name wait
+  ensure_boss_claim wait
   ensure_config
   local change="" project_name="" arg
   while [ $# -gt 0 ]; do
@@ -875,7 +997,7 @@ cmd_wait() {
 # --------------------------------------------------------------- retrigger ---
 
 cmd_retrigger() {
-  ensure_boss_name retrigger
+  ensure_boss_claim retrigger
   ensure_config
   local change="" project_name="" note="" note_given=0 arg
   while [ $# -gt 0 ]; do
@@ -942,7 +1064,7 @@ tasks_file_for() {
 # ------------------------------------------------------------------ finish ---
 
 cmd_finish() {
-  ensure_boss_name finish
+  ensure_boss_claim finish
   ensure_config
   local change="" project_name="" force=0 arg
   while [ $# -gt 0 ]; do
@@ -1028,7 +1150,7 @@ cmd_finish() {
 # ------------------------------------------------------------------ answer ---
 
 cmd_answer() {
-  ensure_boss_name answer
+  ensure_boss_claim answer
   ensure_config
   local change="" project_name="" arg
   local -a keys=()
@@ -1074,6 +1196,7 @@ main() {
     retrigger) shift; cmd_retrigger "$@" ;;
     finish) shift; cmd_finish "$@" ;;
     answer) shift; cmd_answer "$@" ;;
+    claim) shift; cmd_claim "$@" ;;
     -h|--help) usage ;;
     "") usage ;;
     *) usage_error "unknown command: ${1:-}" ;;

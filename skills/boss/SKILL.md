@@ -68,6 +68,27 @@ finishes.
    `y`) or to end the apply (`boss finish <change> --force`). You make the
    decision, not the apply agent.
 
+## One boss per Herdr workspace
+
+The boss session is a Herdr agent, not a global singleton: every workspace has
+its own. `boss claim` makes the current pane the boss of its workspace
+(`--name <name>` sets the agent name, `--release` gives the role up). The
+default name is `boss-<workspace>`; Herdr limits names to 32 characters. There
+is at most one living boss per workspace, but different workspaces can each have
+one in parallel.
+
+You do not have to claim explicitly: `boss dispatch`, `boss retrigger`,
+`boss finish` and `boss answer` claim a free workspace automatically before they
+run, and they refuse to run when another living pane is the boss of this
+workspace. `boss status`, `boss wait` and `boss review` stay read-only and work
+regardless of who owns the workspace.
+
+Who wakes whom: when an apply settles, the waiter resolves the responsible boss
+in this order: (1) the boss registered for the workspace the apply runs in,
+(2) the boss that dispatched the apply (recorded in the apply state), (3) the
+global `BOSS_AGENT_NAME` (default `boss`). Dead agents are skipped; when none is
+reachable, a Herdr notification points to the apply instead of a prompt.
+
 ## Abort criterion
 
 If after **3 retriggers** of the same change no progress is visible (no
