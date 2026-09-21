@@ -177,6 +177,16 @@ boss_write_registry() {
     || die_json "state_write" "cannot write boss registry $file"
 }
 
+# boss_registered_pane_ids -- pane ids of every registered boss, one per line
+boss_registered_pane_ids() {
+  local f
+  [ -d "$BOSS_BOSSES_DIR" ] || return 0
+  for f in "$BOSS_BOSSES_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    jq -r '.pane_id // empty' "$f" 2>/dev/null || true
+  done
+}
+
 # boss_agent_name <workspace-id> -- registered agent of the workspace's boss, or empty
 boss_agent_name() {
   local reg

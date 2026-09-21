@@ -452,23 +452,23 @@ check_apply_ready() {
 }
 
 # find_running_apply <change> <project> -- {pane_id,tab_id,workspace_id} of a live
-# apply for this change in this project (pane tokens os_change/os_phase or a live
-# agent apply-<change>, both scoped to the project's working tree), or empty.
+# apply for this change in this project: a living agent named
+# apply_agent_name <change> whose cwd is in the project tree, or empty. Pane
+# tokens are deliberately ignored (any session can set them); the calling pane
+# and registered boss panes are never treated as a running apply.
 find_running_apply() {
-  local change="$1" project="$2" panes agents hit
-  panes="$(herdr_json pane list)" || exit 1
-  hit="$(printf '%s' "$panes" | jq -c \
-    --arg c "$change" --arg p "$project" --arg ps "$project/" \
-    '[.panes[] | select((.tokens.os_change // "") == $c and (.tokens.os_phase // "") == "apply"
-        and (((.cwd // "") == $p) or (((.cwd // "") | startswith($ps)))))
-      | {pane_id, tab_id, workspace_id}] | .[0] // empty')"
-  if [ -z "$hit" ] || [ "$hit" = "null" ]; then
-    agents="$(herdr_json agent list)" || exit 1
-    hit="$(printf '%s' "$agents" | jq -c \
-      --arg n "$(apply_agent_name "$change")" --arg p "$project" --arg ps "$project/" \
-      '[.agents[] | select(.name == $n and (((.cwd // "") == $p) or (((.cwd // "") | startswith($ps)))))
+  local change="$1" project="$2" agents hit excluded
+  agents="$(herdr_json agent list)" || exit 1
+  excluded="$(boss_registered_pane_ids)"
+  hit="$(printf '%s' "$agents" | jq -c \
+    --arg n "$(apply_agent_name "$change")" --arg p "$project" --arg ps "$project/" \
+    --arg self "${HERDR_PANE_ID:-}" --arg ex "$excluded" \
+    '[.agents[] | select(.name == $n)
+        | select(((.cwd // "") == $p) or (((.cwd // "") | startswith($ps))))
+        | .pane_id as $pid
+        | select(($pid // "") != $self)
+        | select(($ex | split("\n") | index($pid)) | not)
         | {pane_id, tab_id, workspace_id}] | .[0] // empty')"
-  fi
   printf '%s' "$hit"
 }
 
