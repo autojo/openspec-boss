@@ -21,6 +21,7 @@ Usage:
   boss finish <change> [--project <name|path>] [--force]
   boss answer <change> <key>... [--project <name|path>]
   boss claim [--name <name>] [--release]
+  boss session [--project <name|path>] [--runner <name>]
   boss config-json
   boss --help
 EOF
@@ -233,47 +234,7 @@ cmd_claim() {
     return 0
   fi
 
-  if [ -z "$name" ]; then
-    name="$(boss_name_for "$workspace_id")"
-  else
-    name="$(normalize_name "$name")"
-    [ -n "$name" ] || usage_error "--name must contain a usable name (letters, digits, - or _)"
-  fi
-
-  local agents reg_pane reg_agent
-  agents="$(boss_agents)"
-  if [ -f "$reg" ]; then
-    reg_pane="$(jq -r '.pane_id // empty' "$reg" 2>/dev/null || true)"
-    reg_agent="$(jq -r '.agent // empty' "$reg" 2>/dev/null || true)"
-    if [ -n "$reg_pane" ]; then
-      if [ "$reg_pane" = "$pane_id" ]; then
-        if [ -n "$reg_agent" ] && [ "$name" != "$reg_agent" ]; then
-          herdr_json agent rename "$pane_id" "$name" >/dev/null || exit 1
-          boss_write_registry "$reg" "$workspace_id" "$pane_id" "$name"
-          reg_agent="$name"
-        fi
-        printf '%s\n' "$(jq -n --arg w "$workspace_id" --arg p "$pane_id" --arg a "$reg_agent" \
-          '{workspace_id: $w, pane_id: $p, agent: $a, status: "already_claimed"}')"
-        return 0
-      fi
-      if boss_agent_alive_pane "$agents" "$reg_pane"; then
-        die_json "boss_exists" "workspace $workspace_id already has a boss on pane $reg_pane (agent ${reg_agent:-unknown})"
-      fi
-    fi
-  fi
-
-  local owner
-  owner="$(printf '%s' "$agents" | jq -r --arg n "$name" \
-    'map(select(type == "object" and .name == $n)) | .[0].pane_id // empty')"
-  if [ -n "$owner" ] && [ "$owner" != "$pane_id" ]; then
-    die_json "boss_exists" "agent '$name' already belongs to pane $owner; choose another name with --name"
-  fi
-
-  herdr_json agent rename "$pane_id" "$name" >/dev/null || exit 1
-  boss_write_registry "$reg" "$workspace_id" "$pane_id" "$name"
-  log "claimed boss of workspace $workspace_id as agent '$name' (pane $pane_id)"
-  printf '%s\n' "$(jq -n --arg w "$workspace_id" --arg p "$pane_id" --arg a "$name" \
-    '{workspace_id: $w, pane_id: $p, agent: $a, status: "claimed"}')"
+  boss_claim_pane "$workspace_id" "$pane_id" "$name"
 }
 
 # ensure_boss_claim <mode> -- make sure the calling pane is the boss of its
@@ -342,6 +303,101 @@ ensure_boss_claim() {
   boss_write_registry "$reg" "$workspace_id" "$pane_id" "$name"
   log "auto-claimed boss of workspace $workspace_id as agent '$name' (pane $pane_id)"
   return 0
+}
+
+# ---------------------------------------------------------------- session ---
+
+# cmd_session [--project <name|path>] [--runner <name>] -- start a boss tab in
+# the target project's Herdr workspace with the runner's scoped env and register
+# the new pane as that workspace's boss. The calling pane is left untouched.
+cmd_session() {
+  if [ "${HERDR_ENV:-}" != "1" ]; then
+    die_json "not_in_herdr" "boss session requires a Herdr pane (HERDR_ENV is not set)"
+  fi
+  ensure_config
+
+  local project_name="" runner_name="" arg
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --project) project_name="${1:-}"; shift ;;
+      --runner) runner_name="${1:-}"; shift ;;
+      -h|--help) usage ;;
+      --*) usage_error "unknown option: $arg" ;;
+      *) usage_error "unexpected argument: $arg" ;;
+    esac
+  done
+
+  local runner project workspace_id agent_name kind
+  runner="$(resolve_runner "$runner_name")" || exit 1
+  project="$(resolve_project "$project_name")" || exit 1
+  workspace_id="$(ensure_workspace "$project" "$(basename "$project")")"
+  agent_name="$(boss_name_for "$workspace_id")"
+
+  local existing_boss
+  existing_boss="$(boss_workspace_boss_pane "$workspace_id")"
+  if [ -n "$existing_boss" ]; then
+    die_json "boss_exists" "workspace $workspace_id already has a boss on pane $existing_boss; no second boss tab was created"
+  fi
+
+  kind="$(printf '%s' "$runner" | jq -r '.kind')"
+  local -a agent_args=()
+  while IFS= read -r a; do agent_args+=("$a"); done < <(printf '%s' "$runner" | jq -r '.args[]? // empty')
+  local -a env_args=()
+  while IFS= read -r e; do [ -n "$e" ] && env_args+=(--env "$e"); done < <(runner_env_of "$runner")
+
+  local created pane_id tab_id
+  if [ "${#env_args[@]}" -gt 0 ]; then
+    created="$(herdr_json tab create --workspace "$workspace_id" --cwd "$project" --label "boss" --no-focus "${env_args[@]}")" || exit 1
+  else
+    created="$(herdr_json tab create --workspace "$workspace_id" --cwd "$project" --label "boss" --no-focus)" || exit 1
+  fi
+  pane_id="$(printf '%s' "$created" | jq -r '.root_pane.pane_id // empty')"
+  tab_id="$(printf '%s' "$created" | jq -r '.tab.tab_id // .root_pane.tab_id // empty')"
+  [ -n "$pane_id" ] && [ -n "$tab_id" ] || die_json "tab_create_failed" "herdr tab create returned no pane/tab for $project"
+  # From here on a failure must not leave the tab behind (see die_json).
+  BOSS_FAILED_TAB="$tab_id"
+  BOSS_FAILED_PANE="$pane_id"
+
+  # Start the agent, retrying while the fresh shell pane is still busy.
+  local started=0 deadline out rc code=""
+  deadline=$(( $(date +%s%3N) + BOSS_AGENT_BUSY_RETRY_MS ))
+  while :; do
+    if [ "${#agent_args[@]}" -gt 0 ]; then
+      out="$(herdr agent start "$agent_name" --kind "$kind" --pane "$pane_id" --timeout "$BOSS_AGENT_START_TIMEOUT_MS" -- "${agent_args[@]}" 2>&1)"
+    else
+      out="$(herdr agent start "$agent_name" --kind "$kind" --pane "$pane_id" --timeout "$BOSS_AGENT_START_TIMEOUT_MS" 2>&1)"
+    fi
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      started=1
+      break
+    fi
+    code="$(printf '%s' "$out" | jq -r '.error.code // ""' 2>/dev/null || true)"
+    [ "$code" = "agent_pane_busy" ] || break
+    [ "$(date +%s%3N)" -lt "$deadline" ] || break
+    log "agent start for $agent_name hit a busy pane; retrying"
+    sleep 1
+  done
+  if [ "$started" -ne 1 ]; then
+    local msg="agent '$agent_name' did not become ready within the start timeout"
+    if [ -n "$code" ] && [ "$code" != "agent_pane_busy" ]; then
+      msg="agent '$agent_name' failed to start: $code"
+    fi
+    die_json "agent_not_ready" "$msg (pane $pane_id, tab $tab_id closed)"
+  fi
+
+  local claim
+  claim="$(boss_claim_pane "$workspace_id" "$pane_id" "$agent_name")" || exit 1
+  agent_name="$(printf '%s' "$claim" | jq -r '.agent // empty')"
+  BOSS_FAILED_TAB=""
+
+  log "session: project=$project runner=$(printf '%s' "$runner" | jq -r '.name') agent=$agent_name tab=$tab_id pane=$pane_id workspace=$workspace_id"
+
+  printf '%s\n' "$(jq -n \
+    --arg project "$project" --arg workspace_id "$workspace_id" --arg agent "$agent_name" \
+    --arg pane_id "$pane_id" --arg tab_id "$tab_id" --arg status "started" \
+    '{project: $project, workspace_id: $workspace_id, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, status: $status}')"
 }
 
 # ------------------------------------------------------ workspace mapping ---
@@ -494,8 +550,15 @@ cmd_dispatch() {
 
   workspace_id="$(ensure_workspace "$project" "$(basename "$project")")"
 
+  local -a env_args=()
+  while IFS= read -r e; do [ -n "$e" ] && env_args+=(--env "$e"); done < <(runner_env_of "$runner")
+
   local created
-  created="$(herdr_json tab create --workspace "$workspace_id" --cwd "$project" --label "$change" --no-focus)" || exit 1
+  if [ "${#env_args[@]}" -gt 0 ]; then
+    created="$(herdr_json tab create --workspace "$workspace_id" --cwd "$project" --label "$change" --no-focus "${env_args[@]}")" || exit 1
+  else
+    created="$(herdr_json tab create --workspace "$workspace_id" --cwd "$project" --label "$change" --no-focus)" || exit 1
+  fi
   pane_id="$(printf '%s' "$created" | jq -r '.root_pane.pane_id // empty')"
   tab_id="$(printf '%s' "$created" | jq -r '.tab.tab_id // .root_pane.tab_id // empty')"
   [ -n "$pane_id" ] && [ -n "$tab_id" ] || die_json "tab_create_failed" "herdr tab create returned no pane/tab for $project"
@@ -1197,6 +1260,7 @@ main() {
     finish) shift; cmd_finish "$@" ;;
     answer) shift; cmd_answer "$@" ;;
     claim) shift; cmd_claim "$@" ;;
+    session) shift; cmd_session "$@" ;;
     -h|--help) usage ;;
     "") usage ;;
     *) usage_error "unknown command: ${1:-}" ;;

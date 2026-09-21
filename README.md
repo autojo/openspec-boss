@@ -80,6 +80,7 @@ boss retrigger <change> [--project <name|path>] [--note <text>]
 boss finish <change> [--project <name|path>] [--force]
 boss answer <change> <key>... [--project <name|path>]
 boss claim [--name <name>] [--release]
+boss session [--project <name|path>] [--runner <name>]
 boss config-json
 ```
 
@@ -121,14 +122,20 @@ boss config-json
   `released`). `--name` overrides the derived agent name `boss-<workspace>`;
   `--release` removes the entry again. There is at most one living boss per
   workspace, but different workspaces can each have one.
+- `session` starts a new boss tab in the target project's workspace with the
+  runner's scoped `env` and registers the new pane as that workspace's boss
+  (same claim rules as `claim`). The calling pane is left untouched. It returns
+  `{project, workspace_id, agent, pane_id, tab_id, status}`; a workspace that
+  already has a living boss is refused with `boss_exists` before any tab is
+  created. Use it to stand up a boss for another project.
 
 All commands print JSON; errors appear as JSON on stderr with exit status 1
 (like Herdr). The tools provide thin slash commands:
-`/boss:dispatch`, `/boss:status`, `/boss:wait`, `/boss:retrigger`,
-`/boss:finish`, `/boss:claim` (Claude Code) or `/boss-dispatch`,
-`/boss-status`, `/boss-wait`, `/boss-retrigger`, `/boss-finish`,
-`/boss-claim` (OpenCode), which simply call the `boss` command of the same
-name.
+`/boss:dispatch`, `/boss:session`, `/boss:status`, `/boss:wait`,
+`/boss:retrigger`, `/boss:finish`, `/boss:claim` (Claude Code) or
+`/boss-dispatch`, `/boss-session`, `/boss-status`, `/boss-wait`,
+`/boss-retrigger`, `/boss-finish`, `/boss-claim` (OpenCode), which simply call
+the `boss` command of the same name.
 
 ## Configuration (`~/.config/openspec-boss/boss.toml`)
 
@@ -157,6 +164,16 @@ arguments of the claude runner are a deliberate choice: an apply without a
 human at the tab would otherwise stall on every permission prompt. If you
 don't want that, delete the `args` line in `boss.toml`.
 
+A runner may carry an optional `env` array of `KEY=VALUE` strings: boss sets
+exactly these variables on the tab it starts (`herdr tab create --env`). For
+`kind = "opencode"` a missing field yields the built-in default
+`OPENCODE_CONFIG_CONTENT={"permission":"allow"}` – the highest-precedence
+OpenCode config, so allow-all applies only inside the tabs boss starts, not to
+every OpenCode session on the machine. A custom `env` replaces the default,
+`env = []` disables it. Other kinds get nothing without an explicit `env`
+(claude keeps `--permission-mode bypassPermissions`). Existing configurations
+without the field stay valid.
+
 A runner may carry an optional `yield` string: the instruction appended to
 every apply prompt (and reused by `retrigger`). Without the field the built-in
 default is used ("end your turn, do not wait or poll for a review"); `yield = ""`
@@ -169,6 +186,26 @@ waiter sends the boss an informational "still working" notice and keeps waiting;
 it never treats the timeout as a lost agent. Set it above your longest normal
 apply to avoid noise.
 
+## Limiting permissions to the workspace
+
+By default OpenCode already allows everything, and a global
+`"permission": "allow"` in `~/.config/opencode/opencode.jsonc` extends that to
+**every** OpenCode session on the machine. boss does not touch that file. To
+actually scope the grant:
+
+1. Make the global rule restrictive again, e.g. `"permission": "ask"` (or
+   remove the line). Sessions you start by hand then ask for confirmation.
+2. Let boss start its sessions: apply tabs (`boss dispatch`) and boss tabs
+   (`boss session`) get `OPENCODE_CONFIG_CONTENT={"permission":"allow"}` as an
+   env variable, which overrides the global and the project config. Only those
+   tabs run unattended.
+
+The scope is per process, not per path: a session started with `allow` can
+still read and write outside the workspace. That is intended for the boss
+session, which drives its workspace; disable the default with `env = []` on a
+runner if you do not want it. For `kind = "claude"` nothing changes – the
+scoping there remains `--permission-mode bypassPermissions` on the runner.
+
 ## Dependencies
 
 - **Herdr ≥ 0.9** with installed integrations for every runner kind in use
@@ -178,8 +215,9 @@ apply to avoid noise.
   not know its command.
 - **jq**, **bash ≥ 4**, **python3 ≥ 3.11** (only for `tomllib`), **setsid**
   (util-linux, for the detached waiter).
-- **OpenCode** configured globally with `"permission": "allow"` – this repo
-  does not change that, it is assumed to be in place.
+- **OpenCode** – the global `"permission"` setting is left untouched. The
+  scoped grant lives in `OPENCODE_CONFIG_CONTENT` on the boss tabs; see
+  [Limiting permissions to the workspace](#limiting-permissions-to-the-workspace).
 - Target projects need `.claude/commands/opsx/` and
   `.opencode/commands/opsx-*.md` (created by `openspec init`).
 

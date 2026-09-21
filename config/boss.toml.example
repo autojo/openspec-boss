@@ -8,6 +8,11 @@ default = "opencode"
 kind = "opencode"
 args = []
 apply = "/opsx-apply {change}"
+# Optional: environment variables set for the tab this runner is started in.
+# Without the field an opencode runner gets the built-in default
+# OPENCODE_CONFIG_CONTENT={"permission":"allow"}, which grants allow-all only
+# inside boss tabs. Set your own list to replace it, or env = [] to disable it.
+# env = ["OPENCODE_CONFIG_CONTENT={\"permission\":\"ask\"}"]
 # Optional: instruction appended to every apply prompt (and reused by retrigger).
 # Leave the field out to use the built-in default ("end your turn, do not wait
 # for a review"). Set yield = "" to send no instruction.

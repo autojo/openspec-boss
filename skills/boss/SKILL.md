@@ -89,6 +89,23 @@ in this order: (1) the boss registered for the workspace the apply runs in,
 global `BOSS_AGENT_NAME` (default `boss`). Dead agents are skipped; when none is
 reachable, a Herdr notification points to the apply instead of a prompt.
 
+## Boss sessions and scoped permissions
+
+`boss session [--project <name|path>] [--runner <name>]` starts a new boss tab
+in the target project's workspace with the runner's config and registers that
+new pane as the workspace boss. Use it to bring up a boss for another project
+(one workspace per project) without becoming that workspace's boss yourself;
+the calling pane is never renamed or registered. A workspace that already has a
+living boss is refused with `boss_exists`.
+
+The tab is started with the runner's resolved `env` (`herdr tab create --env`).
+For `kind = "opencode"` the built-in default is
+`OPENCODE_CONFIG_CONTENT={"permission":"allow"}`, the highest-precedence
+OpenCode config: it overrides the global and project config, so allow-all
+applies only inside tabs boss starts. To use it, make the global
+`"permission"` restrictive (e.g. `ask`); boss never edits your global config.
+A custom `env` on the runner replaces the default, `env = []` disables it.
+
 ## Abort criterion
 
 If after **3 retriggers** of the same change no progress is visible (no

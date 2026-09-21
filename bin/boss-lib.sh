@@ -24,6 +24,10 @@ BOSS_WAITER_STALL_MS="${BOSS_WAITER_STALL_MS:-2700000}"
 # the apply must end its turn, the boss is woken by the waiter and retriggers.
 BOSS_APPLY_YIELD_DEFAULT="When done or paused, end your turn and stop. Do not wait or poll for a review - the boss is woken automatically and will retrigger you."
 
+# Env for an opencode runner without an explicit 'env' field: inline config
+# with the highest standard precedence, so only tabs started by boss get it.
+BOSS_OPENCODE_ENV_DEFAULT='OPENCODE_CONFIG_CONTENT={"permission":"allow"}'
+
 # When set (by bin/boss-waiter), log() appends to this file instead of stderr.
 BOSS_LOG_FILE="${BOSS_LOG_FILE:-}"
 
@@ -133,6 +137,17 @@ boss_name_for() {
   printf 'boss-%s-%s\n' "$head" "$hash"
 }
 
+# runner_env_of <runner-json> -- the runner's resolved env entries, one per
+# line. A missing field yields the built-in opencode default for kind=opencode
+# and nothing for other kinds; an empty array yields nothing; otherwise exactly
+# the configured entries.
+runner_env_of() {
+  printf '%s' "$1" | jq -r --arg d "$BOSS_OPENCODE_ENV_DEFAULT" \
+    'if has("env") then (.env[]? // empty)
+     elif .kind == "opencode" then $d
+     else empty end'
+}
+
 # boss_agents -- compact '.agents' array from 'herdr agent list', or '[]' when
 # Herdr is unavailable. Tolerant on purpose: callers use it only for liveness.
 boss_agents() {
@@ -169,6 +184,77 @@ boss_agent_name() {
   reg="$(boss_registry_file_for "$1")"
   [ -f "$reg" ] || return 0
   jq -r '.agent // empty' "$reg" 2>/dev/null || true
+}
+
+# boss_workspace_boss_pane <workspace-id> -- pane id of the workspace's living
+# boss, or empty (no entry, no pane, or the pane is gone).
+boss_workspace_boss_pane() {
+  local workspace_id="${1:-}" reg reg_pane
+  [ -n "$workspace_id" ] || return 0
+  reg="$(boss_registry_file_for "$workspace_id")"
+  [ -f "$reg" ] || return 0
+  reg_pane="$(jq -r '.pane_id // empty' "$reg" 2>/dev/null || true)"
+  [ -n "$reg_pane" ] || return 0
+  if boss_agent_alive_pane "$(boss_agents)" "$reg_pane"; then
+    printf '%s' "$reg_pane"
+  fi
+}
+
+# boss_claim_pane <workspace-id> <pane-id> [<name>] -- register an existing pane
+# as the boss of its workspace, keeping one registry entry per workspace and
+# following the same rules as 'boss claim'. Prints the claim JSON (status
+# claimed/already_claimed). Dies with boss_exists when another living pane owns
+# the workspace or the derived name. Used by 'boss claim' (caller pane) and
+# 'boss session' (the newly created pane).
+boss_claim_pane() {
+  local workspace_id="${1:-}" pane_id="${2:-}" name="${3:-}"
+  [ -n "$pane_id" ] || die_json "not_in_herdr" "cannot claim the boss role without a pane id"
+  [ -n "$workspace_id" ] || die_json "not_in_herdr" "cannot claim the boss role without a workspace id"
+
+  local reg
+  reg="$(boss_registry_file_for "$workspace_id")"
+
+  if [ -z "$name" ]; then
+    name="$(boss_name_for "$workspace_id")"
+  else
+    name="$(normalize_name "$name")"
+    [ -n "$name" ] || usage_error "--name must contain a usable name (letters, digits, - or _)"
+  fi
+
+  local agents reg_pane reg_agent
+  agents="$(boss_agents)"
+  if [ -f "$reg" ]; then
+    reg_pane="$(jq -r '.pane_id // empty' "$reg" 2>/dev/null || true)"
+    reg_agent="$(jq -r '.agent // empty' "$reg" 2>/dev/null || true)"
+    if [ -n "$reg_pane" ]; then
+      if [ "$reg_pane" = "$pane_id" ]; then
+        if [ -n "$reg_agent" ] && [ "$name" != "$reg_agent" ]; then
+          herdr_json agent rename "$pane_id" "$name" >/dev/null || exit 1
+          boss_write_registry "$reg" "$workspace_id" "$pane_id" "$name"
+          reg_agent="$name"
+        fi
+        printf '%s\n' "$(jq -n --arg w "$workspace_id" --arg p "$pane_id" --arg a "$reg_agent" \
+          '{workspace_id: $w, pane_id: $p, agent: $a, status: "already_claimed"}')"
+        return 0
+      fi
+      if boss_agent_alive_pane "$agents" "$reg_pane"; then
+        die_json "boss_exists" "workspace $workspace_id already has a boss on pane $reg_pane (agent ${reg_agent:-unknown})"
+      fi
+    fi
+  fi
+
+  local owner
+  owner="$(printf '%s' "$agents" | jq -r --arg n "$name" \
+    'map(select(type == "object" and .name == $n)) | .[0].pane_id // empty')"
+  if [ -n "$owner" ] && [ "$owner" != "$pane_id" ]; then
+    die_json "boss_exists" "agent '$name' already belongs to pane $owner; choose another name with --name"
+  fi
+
+  herdr_json agent rename "$pane_id" "$name" >/dev/null || exit 1
+  boss_write_registry "$reg" "$workspace_id" "$pane_id" "$name"
+  log "claimed boss of workspace $workspace_id as agent '$name' (pane $pane_id)"
+  printf '%s\n' "$(jq -n --arg w "$workspace_id" --arg p "$pane_id" --arg a "$name" \
+    '{workspace_id: $w, pane_id: $p, agent: $a, status: "claimed"}')"
 }
 
 # boss_resolve_agent <state-file> -- agent name of the boss responsible for an
