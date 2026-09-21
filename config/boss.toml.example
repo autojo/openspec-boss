@@ -8,6 +8,10 @@ default = "opencode"
 kind = "opencode"
 args = []
 apply = "/opsx-apply {change}"
+# Optional: instruction appended to every apply prompt (and reused by retrigger).
+# Leave the field out to use the built-in default ("end your turn, do not wait
+# for a review"). Set yield = "" to send no instruction.
+# yield = "Stop after this turn; the boss is woken automatically."
 
 [runners.claude]
 kind = "claude"

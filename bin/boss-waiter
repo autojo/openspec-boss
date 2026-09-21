@@ -20,11 +20,13 @@ change="$(jq -r '.change' "$state_file")"
 # replaced by any later `agent rename`; the pane id stays stable.
 agent="$(jq -r '.pane_id // .agent' "$state_file")"
 project="$(jq -r '.project' "$state_file")"
+events_file="$(events_file_for "$project" "$change")"
 
 log_file="$BOSS_LOGS_DIR/$change-$(date '+%Y%m%dT%H%M%S').log"
 mkdir -p "$BOSS_LOGS_DIR" || exit 1
 BOSS_LOG_FILE="$log_file"
 log "waiter start: change=$change agent=$agent project=$project"
+waiter_start_epoch="$(date +%s)"
 
 # Record our pid so retrigger/finish can stop us.
 tmp="$(mktemp)"
@@ -49,30 +51,57 @@ update_state() {
 child_pid=""
 trap 'log "waiter terminated"; [ -n "$child_pid" ] && kill "$child_pid" 2>/dev/null; exit 0' TERM INT
 
+# report_stall -- tell the boss the apply is still working, without ending it.
+report_stall() {
+  local elapsed text
+  elapsed=$(( $(date +%s) - waiter_start_epoch ))
+  printf -v text 'Apply %s in %s: still working (%ss). No action needed unless you expected it to be done. Next step: boss status %s' \
+    "$change" "$project" "$elapsed" "$change"
+  log "still working after ${elapsed}s; reporting a stall notice"
+  deliver "$text" "working"
+}
+
 # wait_for [<--until STATE>...] -- run 'herdr agent wait' on the apply pane
-# (settled states by default) as an interruptible child; on failure the agent
-# is gone: report 'lost' and return 1.
+# (settled states by default) as an interruptible child. With a stall interval
+# set, a wait that times out means the agent is still working: report it and
+# keep waiting. Only a real failure (the agent is gone) reports 'lost'.
 wait_for() {
   local out_file rc out code msg
-  out_file="$(mktemp)"
-  herdr agent wait "$agent" "$@" >"$out_file" 2>&1 &
-  child_pid=$!
-  wait "$child_pid"
-  rc=$?
-  child_pid=""
-  out="$(cat "$out_file")"
-  rm -f "$out_file"
-  if [ "$rc" -ne 0 ]; then
+  while true; do
+    out_file="$(mktemp)"
+    if [ "${BOSS_WAITER_STALL_MS:-0}" -gt 0 ]; then
+      herdr agent wait "$agent" "$@" --timeout "$BOSS_WAITER_STALL_MS" >"$out_file" 2>&1 &
+    else
+      herdr agent wait "$agent" "$@" >"$out_file" 2>&1 &
+    fi
+    child_pid=$!
+    wait "$child_pid"
+    rc=$?
+    child_pid=""
+    out="$(cat "$out_file")"
+    rm -f "$out_file"
+    if [ "$rc" -eq 0 ]; then
+      return 0
+    fi
     code="$(printf '%s' "$out" | jq -r '.error.code // "wait_failed"' 2>/dev/null || true)"
+    case "$code" in
+      *timeout*)
+        log "agent wait timed out after ${BOSS_WAITER_STALL_MS}ms"
+        report_stall
+        continue
+        ;;
+    esac
     msg="$(printf '%s' "$out" | jq -r '.error.message // empty' 2>/dev/null || true)"
     log "agent wait failed: $code $msg (apply agent lost?)"
     local text
     printf -v text 'Apply %s in %s: lost (the apply agent disappeared).\nNext step: boss status %s' "$change" "$project" "$change"
     update_state "lost"
+    append_event "$events_file" lost \
+      "$(jq -nc --arg c "$change" --arg p "$project" '{change: $c, project: $p}')" \
+      || log "warning: could not record lost event"
     deliver "$text" "lost"
     return 1
-  fi
-  return 0
+  done
 }
 
 # deliver <text> <state> -- prompt the boss agent; retry with growing backoff
@@ -142,9 +171,17 @@ main() {
 
     log "settled state: $st"
     update_state "$st"
+    append_event "$events_file" settled \
+      "$(jq -nc --arg c "$change" --arg p "$project" --arg s "$st" '{change: $c, project: $p, state: $s}')" \
+      || log "warning: could not record settled event"
 
     if [ "$st" = "blocked" ]; then
       dialog="$(herdr agent read "$agent" --source visible 2>/dev/null || true)"
+      log "blocked dialog: $dialog"
+      append_event "$events_file" blocked \
+        "$(jq -nc --arg c "$change" --arg p "$project" --arg d "$(printf '%s' "$dialog" | cut -c1-500)" \
+          '{change: $c, project: $p, dialog: $d}')" \
+        || log "warning: could not record blocked event"
       printf -v text 'Apply %s in %s: blocked.\nVisible dialog of the apply pane:\n%s\nNext step: boss status %s' "$change" "$project" "$dialog" "$change"
       # After an answer the agent may go straight to idle without working.
       next_wait=(--until working --until idle --until done)

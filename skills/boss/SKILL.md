@@ -24,7 +24,11 @@ finishes.
    Use `--note` to hand the apply agent context it cannot know (a real case
    to test against, which tool to use for a check, who reviews). The JSON
    result contains agent, pane and tab. You do not switch into the apply
-   tab; the apply agent works there on its own.
+   tab; the apply agent works there on its own. Every apply prompt ends with a
+   yield instruction: the apply stops at the end of its turn and does not wait
+   or poll for a review. An apply that is still `working` thus stays silent –
+   if it stays that way longer than `BOSS_WAITER_STALL_MS` (default 45 min), the
+   waiter sends you a "still working" notice, no action required.
 3. **Being woken** – the waiter reports completion to you as a prompt, e.g.
    `Apply add-auth in ~/work/shop: done. Next step: boss status add-auth`. If
    the prompt arrives while you are working, it is queued – handle it after
@@ -33,13 +37,17 @@ finishes.
    `boss answer`, or a direct `herdr agent prompt`), you are woken again. If
    you prompted the agent directly and are unsure a waiter is alive, run
    `boss wait <change>`.
-4. **Review** – `boss status <change>` (or `--json`). Check:
-   - all tasks in `tasks.md` checked off (`tasks.open == 0`)?
+4. **Review** – `boss review <change> --json` gathers the deterministic
+   facts (tasks, `openspec validate`, recognizable tests, git) and the
+   friction from the event log. Check:
+   - `quality.tasks.open == 0`?
+   - `quality.validate == "pass"`?
+   - `quality.tests.result` is `pass` or `not_run` (not `fail`)?
    - diff plausible? Read the changed files yourself (in the target project).
-   - `cd <project> && openspec validate --strict` passes?
-   - the project's tests pass if a standard command is recognizable
-     (`npm test`, `pytest`, `just test`)?
+   - `friction.retriggers` / `friction.blocked_count` show how bumpy the run
+     was – a reason to look closer, not a failure by itself.
    - in Claude Code optionally: `/code-review` on the diff.
+   `boss status <change>` still shows the live agent state and the apply tab.
 5. **Fix** – if the review finds problems: correct proposal/specs in the
    target project with your tool's update command (Claude Code:
    `/opsx:update <change>`, OpenCode: `/opsx-update <change>`), then

@@ -65,6 +65,7 @@ the same way in Claude Code and OpenCode.
 ```bash
 boss dispatch <change> [--project <name|path>] [--runner <name>] [--note <text>]
 boss status [<change>] [--project <name|path>] [--json]
+boss review <change> [--project <name|path>] [--json]
 boss wait <change> [--project <name|path>]
 boss retrigger <change> [--project <name|path>] [--note <text>]
 boss finish <change> [--project <name|path>] [--force]
@@ -78,7 +79,9 @@ boss config-json
   appends free text to the apply command so the boss can hand the apply agent
   context (what to test against, which tool to use for a check, who reviews)
   without touching the runner template; the note is stored and reused by
-  `retrigger`.
+  `retrigger`. Every apply prompt ends with a **yield instruction** that tells
+  the apply agent to stop at the end of its turn instead of waiting or polling
+  for a review – the waiter wakes the boss instead (see `yield` below).
 - `status` shows the agent state, open/done tasks from `tasks.md`,
   `git status`/`git diff --stat` of the target project and the apply tab; when
   `blocked`, it also shows the visible dialog. Without a change name, all
@@ -86,6 +89,12 @@ boss config-json
   agent: `agent_status` (alias of `agent_state`), `pane` (`pane_id`, `tab_id`,
   `workspace_id`, `cwd`, `focused`) and `herdr_agent` (the raw agent object,
   `null` when the agent is gone), plus the stored `note`.
+- `review` gathers the deterministic review facts for an apply: task counts,
+  `openspec validate --strict`, a recognizable standard test command
+  (`just test`, `npm test`, `pytest`, `make test`), the git status, and the
+  friction recorded in the event log (retriggers, blocked events, lost
+  waiters, duration, note). It is read-only, does not touch the apply agent and
+  also works after `finish`, when only the event log is left.
 - `wait` makes sure a waiter is armed for the apply (starts one if none is
   alive, otherwise reports the running one). Use it after prompting the apply
   agent directly through Herdr.
@@ -131,6 +140,18 @@ shop = "~/work/shop"
 arguments of the claude runner are a deliberate choice: an apply without a
 human at the tab would otherwise stall on every permission prompt. If you
 don't want that, delete the `args` line in `boss.toml`.
+
+A runner may carry an optional `yield` string: the instruction appended to
+every apply prompt (and reused by `retrigger`). Without the field the built-in
+default is used ("end your turn, do not wait or poll for a review"); `yield = ""`
+sends no instruction. This keeps the apply from blocking the wake: an agent that
+sits in its own wait loop stays `working`, so the waiter never fires.
+
+`BOSS_WAITER_STALL_MS` (default 2700000 = 45 min, `0` disables) bounds each wait
+in the waiter. If the apply stays `working` for that long without settling, the
+waiter sends the boss an informational "still working" notice and keeps waiting;
+it never treats the timeout as a lost agent. Set it above your longest normal
+apply to avoid noise.
 
 ## Dependencies
 
@@ -181,6 +202,11 @@ the target locations are reported, never overwritten. Remove again with
 - **State files**: `~/.local/state/openspec-boss/applies/` – one file per
   apply with agent, tab, pane and waiter PID; `boss status` without a change
   lists them.
+- **Event logs**: `~/.local/state/openspec-boss/cycles/` – one append-only
+  `*.events.jsonl` per change and project, recording `dispatch`, `retrigger`,
+  `settled`, `blocked`, `lost`, `finish` and an aggregated `cycle` record.
+  `boss review` reads them; they survive `finish`, so friction stays visible
+  across runs.
 - **Agent stuck?** Read the agent name from `boss status <change> --json`
   (field `agent`; long change names are shortened to `apply-<prefix>-<hash>`
   because Herdr limits names to 32 characters), then `herdr agent get <name>`
@@ -190,7 +216,9 @@ the target locations are reported, never overwritten. Remove again with
   keep the tab for inspection.
 - **No waking?** Check whether an agent `boss` exists (`herdr agent list`)
   and whether the Herdr integration of the runner is installed
-  (`herdr integration status`).
+  (`herdr integration status`). An apply that sits in its own wait loop stays
+  `working` and is never a settled state, so the waiter stays silent; the
+  yield instruction prevents that, and `BOSS_WAITER_STALL_MS` surfaces it.
 - **`boss dispatch` reports `already_running`?** A pane with the tokens
   `os_change`/`os_phase=apply` or the change's apply agent already exists in
   the target project for this change – `boss status` shows it.

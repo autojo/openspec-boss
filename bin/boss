@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # boss -- single control session for OpenSpec apply cycles across projects.
-# Subcommands: dispatch, status, retrigger, finish, answer, config-json.
+# Subcommands: dispatch, status, review, retrigger, finish, answer, config-json.
 
 set -u
 
@@ -15,6 +15,7 @@ boss -- control session for OpenSpec apply cycles (see README.md)
 Usage:
   boss dispatch <change> [--project <name|path>] [--runner <name>] [--note <text>]
   boss status [<change>] [--project <name|path>] [--json]
+  boss review <change> [--project <name|path>] [--json]
   boss wait <change> [--project <name|path>]
   boss retrigger <change> [--project <name|path>] [--note <text>]
   boss finish <change> [--project <name|path>] [--force]
@@ -133,6 +134,14 @@ resolve_runner() {
     die_json "unknown_runner" "unknown runner '$name'; configured runners: $configured"
   fi
   printf '%s\n' "$runner" | jq -c --arg n "$name" '. + {name: $n}'
+}
+
+# runner_yield_of <runner-json> -- the yield instruction sent to the apply
+# agent: the runner's own text, or the built-in default when the field is
+# absent. An empty string disables the instruction.
+runner_yield_of() {
+  printf '%s' "$1" | jq -r --arg d "$BOSS_APPLY_YIELD_DEFAULT" \
+    'if has("yield") then .yield else $d end'
 }
 
 # find_openspec_root <dir> -- nearest ancestor containing openspec/, or empty
@@ -408,7 +417,9 @@ cmd_dispatch() {
   fi
 
   apply_cmd="${apply_template/\{change\}/$change}"
-  send_prompt "$agent_name" "$(with_note "$apply_cmd" "$note")"
+  local runner_yield
+  runner_yield="$(runner_yield_of "$runner")"
+  send_prompt "$agent_name" "$(compose_apply_prompt "$apply_cmd" "$note" "$runner_yield")"
 
   herdr_raw "pane.report_metadata" "$(jq -nc --arg p "$pane_id" --arg c "$change" \
     '{pane_id: $p, source: "openspec", tokens: {os_change: $c, os_phase: "apply"}}')" >/dev/null || exit 1
@@ -420,16 +431,20 @@ cmd_dispatch() {
   mkdir -p "$BOSS_APPLIES_DIR" || die_json "state_write" "cannot create state dir $BOSS_APPLIES_DIR"
   jq -n \
     --arg change "$change" --arg project "$project" --arg runner "$runner_name_out" \
-    --arg kind "$kind" --arg apply_cmd "$apply_cmd" --arg note "$note" --arg agent "$agent_name" \
+    --arg kind "$kind" --arg apply_cmd "$apply_cmd" --arg note "$note" --arg yield "$runner_yield" --arg agent "$agent_name" \
     --arg pane_id "$pane_id" --arg tab_id "$tab_id" --arg workspace_id "$workspace_id" \
     --arg started_at "$now" --arg last_state "working" --arg last_state_at "$now" \
-    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at}' \
+    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at}' \
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"
 
   setsid -f "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1
   BOSS_FAILED_TAB=""
 
   log "dispatch: change=$change project=$project runner=$runner_name_out agent=$agent_name tab=$tab_id pane=$pane_id workspace=$workspace_id"
+
+  append_event "$(events_file_for "$project" "$change")" dispatch \
+    "$(jq -nc --arg c "$change" --arg p "$project" --arg r "$runner_name_out" --arg a "$agent_name" \
+      '{change: $c, project: $p, runner: $r, agent: $a}')" || log "warning: could not record dispatch event"
 
   printf '%s\n' "$(jq -n \
     --arg change "$change" --arg project "$project" --arg runner "$runner_name_out" \
@@ -607,6 +622,207 @@ cmd_status() {
   fi
 }
 
+# ------------------------------------------------------------------ review ---
+
+# review_locate <change> [<project-name>] -- locate the apply's sources without
+# dying when only an event log is left. Prints "<project>\t<events-file>\t<state-file>"
+# (state-file empty when the apply was already finished, so it stays last and
+# a leading empty field is never read). Dies with no_apply when there is
+# nothing to review.
+review_locate() {
+  local change="$1" project_name="${2:-}" norm files f count want names
+  local evs ev project state_file
+  norm="$(normalize_name "$change")"
+
+  files="$(ls "$BOSS_APPLIES_DIR"/*-"$norm".json 2>/dev/null || true)"
+  count=0
+  [ -n "$files" ] && count="$(printf '%s\n' "$files" | wc -l | tr -d ' ')"
+  if [ "$count" -gt 0 ]; then
+    if [ "$count" -gt 1 ]; then
+      if [ -n "$project_name" ]; then
+        want="$(resolve_project "$project_name")" || exit 1
+        for f in $files; do
+          [ "$(jq -r '.project' "$f")" = "$want" ] && { state_file="$f"; break; }
+        done
+        [ -n "$state_file" ] || die_json "no_apply" "no apply for change '$change' in $want"
+      else
+        names=""
+        for f in $files; do names="$names $(jq -r '.project' "$f")"; done
+        die_json "ambiguous_change" "change '$change' has applies in multiple projects:$names; pass --project to disambiguate"
+      fi
+    else
+      state_file="$files"
+    fi
+    project="$(jq -r '.project' "$state_file")"
+    printf '%s\t%s\t%s\n' "$project" "$(events_file_for "$project" "$change")" "$state_file"
+    return 0
+  fi
+
+  # No state file: an event log may still exist (it survives boss finish).
+  evs="$(ls "$BOSS_CYCLES_DIR"/*-"$norm".events.jsonl 2>/dev/null || true)"
+  count=0
+  [ -n "$evs" ] && count="$(printf '%s\n' "$evs" | wc -l | tr -d ' ')"
+  if [ "$count" -eq 0 ]; then
+    die_json "no_apply" "no recorded apply or event log for change '$change'"
+  fi
+  if [ "$count" -gt 1 ]; then
+    if [ -n "$project_name" ]; then
+      want="$(resolve_project "$project_name")" || exit 1
+      for ev in $evs; do
+        [ "$(sed -n '1p' "$ev" | jq -r '.project // empty' 2>/dev/null)" = "$want" ] \
+          && { printf '%s\t%s\t%s\n' "$want" "$ev" ""; return 0; }
+      done
+    fi
+    names=""
+    for ev in $evs; do names="$names $(sed -n '1p' "$ev" | jq -r '.project // empty' 2>/dev/null)"; done
+    die_json "ambiguous_change" "change '$change' has event logs in multiple projects:$names; pass --project to disambiguate"
+  fi
+  project="$(sed -n '1p' "$evs" | jq -r '.project // empty' 2>/dev/null)"
+  [ -n "$project" ] || die_json "no_apply" "event log for change '$change' carries no project"
+  printf '%s\t%s\t%s\n' "$project" "$evs" ""
+}
+
+# detect_test_command <project> -- a recognizable standard test command, or empty
+detect_test_command() {
+  local project="$1" jf=""
+  [ -f "$project/Justfile" ] && jf="$project/Justfile"
+  [ -z "$jf" ] && [ -f "$project/justfile" ] && jf="$project/justfile"
+  if [ -n "$jf" ] && grep -qE '^[[:space:]]*test[[:space:]]*:' "$jf" 2>/dev/null; then
+    printf 'just test'
+    return 0
+  fi
+  if [ -f "$project/package.json" ] && jq -e '.scripts.test' "$project/package.json" >/dev/null 2>&1; then
+    printf 'npm test'
+    return 0
+  fi
+  if [ -f "$project/pytest.ini" ] || [ -f "$project/tox.ini" ] \
+    || { [ -f "$project/pyproject.toml" ] && grep -q 'pytest' "$project/pyproject.toml" 2>/dev/null; }; then
+    printf 'pytest'
+    return 0
+  fi
+  if [ -f "$project/Makefile" ] && grep -qE '^test:' "$project/Makefile" 2>/dev/null; then
+    printf 'make test'
+    return 0
+  fi
+  return 0
+}
+
+cmd_review() {
+  # Read-only and herd-free: review must work in the boss session and outside
+  # Herdr alike, so it does not claim the boss agent identity.
+  ensure_config
+  local change="" project_name="" json_only=0 arg
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --json) json_only=1 ;;
+      --project) project_name="${1:-}"; shift ;;
+      -h|--help) usage ;;
+      --*) usage_error "unknown option: $arg" ;;
+      *) if [ -z "$change" ]; then change="$arg"; else usage_error "unexpected argument: $arg"; fi ;;
+    esac
+  done
+  [ -n "$change" ] || usage_error "usage: boss review <change> [--project <name|path>] [--json]"
+
+  local line state_file project ev
+  line="$(review_locate "$change" "$project_name")" || exit 1
+  IFS=$'\t' read -r project ev state_file <<<"$line"
+
+  local tasks_file tasks_open tasks_done tasks_total tasks_json
+  tasks_file="$(tasks_file_for "$project" "$change")"
+  if [ -n "$tasks_file" ]; then
+    tasks_open="$(grep -c '^[[:space:]]*- \[ \]' "$tasks_file" || true)"
+    tasks_done="$(grep -c '^[[:space:]]*- \[x\]' "$tasks_file" || true)"
+    tasks_total=$((tasks_open + tasks_done))
+    tasks_json="$(jq -nc --argjson o "$tasks_open" --argjson d "$tasks_done" --argjson t "$tasks_total" \
+      '{missing: false, open: $o, done: $d, total: $t}')"
+  else
+    tasks_json='{"missing":true,"open":null,"done":null,"total":null}'
+  fi
+
+  local validate_result="not_run"
+  if command -v openspec >/dev/null 2>&1; then
+    if (cd "$project" && openspec validate "$change" --strict >/dev/null 2>&1); then
+      validate_result="pass"
+    else
+      validate_result="fail"
+    fi
+  fi
+
+  local test_cmd test_result="not_run"
+  test_cmd="$(detect_test_command "$project")"
+  if [ -n "$test_cmd" ] && command -v timeout >/dev/null 2>&1; then
+    if (cd "$project" && timeout "$BOSS_REVIEW_TEST_TIMEOUT_S" bash -c "$test_cmd" >/dev/null 2>&1); then
+      test_result="pass"
+    else
+      test_result="fail"
+    fi
+  fi
+
+  local changed_files diff_stat
+  changed_files="$(git -C "$project" status --short 2>/dev/null || true)"
+  diff_stat="$(git -C "$project" diff --stat 2>/dev/null || true)"
+
+  local retriggers blocked_count waiter_lost duration_s note started_at started_epoch
+  retriggers="$(event_count "$ev" retrigger)"
+  blocked_count="$(event_count "$ev" blocked)"
+  waiter_lost=false
+  [ "$(event_count "$ev" lost)" -gt 0 ] && waiter_lost=true
+  note=""
+  duration_s=null
+  if [ -n "$state_file" ] && [ -f "$state_file" ]; then
+    note="$(jq -r '.note // ""' "$state_file")"
+    started_at="$(jq -r '.started_at // ""' "$state_file")"
+    if [ -n "$started_at" ]; then
+      started_epoch="$(date -d "$started_at" +%s 2>/dev/null || true)"
+      [ -n "$started_epoch" ] && duration_s=$(( $(date +%s) - started_epoch ))
+    fi
+  fi
+
+  local json
+  json="$(jq -n \
+    --arg change "$change" --arg project "$project" \
+    --argjson tasks "$tasks_json" --arg validate "$validate_result" \
+    --arg test_result "$test_result" --arg test_cmd "$test_cmd" \
+    --argjson changed_files "$(printf '%s' "$changed_files" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    --argjson diff_stat "$(printf '%s' "$diff_stat" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    --argjson retriggers "$retriggers" --argjson blocked_count "$blocked_count" \
+    --argjson waiter_lost "$waiter_lost" --argjson duration_s "$duration_s" --arg note "$note" \
+    '{change: $change, project: $project,
+      quality: {tasks: $tasks, validate: $validate,
+        tests: {result: $test_result, command: (if $test_cmd == "" then null else $test_cmd end)},
+        git: {changed_files: $changed_files, diff_stat: $diff_stat}},
+      friction: {retriggers: $retriggers, blocked_count: $blocked_count,
+        waiter_lost: $waiter_lost, duration_s: $duration_s,
+        note: (if $note == "" then null else $note end)}}')"
+
+  if [ "$json_only" -eq 1 ]; then
+    printf '%s\n' "$json"
+    return 0
+  fi
+
+  printf 'change: %s\n' "$change"
+  printf 'project: %s\n' "$project"
+  if [ "$(printf '%s' "$tasks_json" | jq -r '.missing')" = "true" ]; then
+    printf 'tasks: missing (no tasks.md)\n'
+  else
+    printf 'tasks: %s open, %s done\n' "$(printf '%s' "$tasks_json" | jq -r '.open')" "$(printf '%s' "$tasks_json" | jq -r '.done')"
+  fi
+  printf 'validate: %s\n' "$validate_result"
+  if [ -n "$test_cmd" ]; then
+    printf 'tests (%s): %s\n' "$test_cmd" "$test_result"
+  else
+    printf 'tests: %s (no standard command recognized)\n' "$test_result"
+  fi
+  printf 'friction: %s retrigger(s), %s blocked, waiter_lost=%s\n' "$retriggers" "$blocked_count" "$waiter_lost"
+  if [ -n "$changed_files" ]; then
+    printf 'git status --short:\n%s\n' "$changed_files"
+  else
+    printf 'git: working tree clean\n'
+  fi
+  printf '%s\n' "$json"
+}
+
 # -------------------------------------------------------------------- wait ---
 
 # ensure_waiter <state-file> -- start a waiter unless one is alive; prints
@@ -674,11 +890,18 @@ cmd_retrigger() {
   done
   [ -n "$change" ] || usage_error "usage: boss retrigger <change> [--project <name|path>] [--note <text>]"
 
-  local state_file agent pane_id apply_cmd res
+  local state_file agent pane_id apply_cmd res project runner_yield
   state_file="$(find_state_file "$change" "$project_name")" || exit 1
   agent="$(jq -r '.agent' "$state_file")"
   pane_id="$(jq -r '.pane_id' "$state_file")"
   apply_cmd="$(jq -r '.apply_cmd' "$state_file")"
+  project="$(jq -r '.project' "$state_file")"
+  if jq -e 'has("yield")' "$state_file" >/dev/null 2>&1; then
+    runner_yield="$(jq -r '.yield' "$state_file")"
+  else
+    # State files from before the yield field: derive it from the runner config.
+    runner_yield="$(runner_yield_of "$(resolve_runner "$(jq -r '.runner // empty' "$state_file")")")"
+  fi
   if [ "$note_given" -eq 1 ]; then
     write_state_field "$state_file" note "$note"
   else
@@ -691,13 +914,29 @@ cmd_retrigger() {
 
   # The waiter stays armed across turns; make sure one is alive before prompting.
   res="$(ensure_waiter "$state_file")"
-  send_prompt "$pane_id" "$(with_note "$apply_cmd" "$note")"
+  send_prompt "$pane_id" "$(compose_apply_prompt "$apply_cmd" "$note" "$runner_yield")"
   log "retrigger: change=$change agent=$agent waiter=$res"
 
+  append_event "$(events_file_for "$project" "$change")" retrigger \
+    "$(jq -nc --arg c "$change" --arg p "$project" '{change: $c, project: $p}')" \
+    || log "warning: could not record retrigger event"
+
   printf '%s\n' "$(jq -n \
-    --arg change "$change" --arg project "$(jq -r '.project' "$state_file")" \
+    --arg change "$change" --arg project "$project" \
     --arg agent "$agent" --arg status "retriggered" \
     '{change: $change, project: $project, agent: $agent, status: $status}')"
+}
+
+# tasks_file_for <project> <change> -- active or archived tasks.md, or empty
+tasks_file_for() {
+  local project="$1" change="$2" f
+  f="$project/openspec/changes/$change/tasks.md"
+  if [ -f "$f" ]; then
+    printf '%s\n' "$f"
+    return 0
+  fi
+  f="$(ls "$project"/openspec/changes/archive/*-"$change"/tasks.md 2>/dev/null | sed -n '1p')"
+  [ -n "$f" ] && printf '%s\n' "$f"
 }
 
 # ------------------------------------------------------------------ finish ---
@@ -743,6 +982,40 @@ cmd_finish() {
     fi
   fi
   kill_waiter "$waiter_pid"
+
+  # Snapshot the friction before the state file (and with it started_at/note)
+  # disappears: append the raw finish event and one aggregated cycle record.
+  local ev retriggers blocked_count waiter_lost duration_s tasks_open started_at tasks_file
+  ev="$(events_file_for "$project" "$change")"
+  retriggers="$(event_count "$ev" retrigger)"
+  blocked_count="$(event_count "$ev" blocked)"
+  waiter_lost=false
+  [ "$(event_count "$ev" lost)" -gt 0 ] && waiter_lost=true
+  started_at="$(jq -r '.started_at // ""' "$state_file")"
+  duration_s=null
+  if [ -n "$started_at" ]; then
+    local started_epoch
+    started_epoch="$(date -d "$started_at" +%s 2>/dev/null || true)"
+    [ -n "$started_epoch" ] && duration_s=$(( $(date +%s) - started_epoch ))
+  fi
+  tasks_open=null
+  tasks_file="$(tasks_file_for "$project" "$change")"
+  if [ -n "$tasks_file" ]; then
+    tasks_open="$(grep -c '^[[:space:]]*- \[ \]' "$tasks_file" || true)"
+  fi
+
+  append_event "$ev" finish \
+    "$(jq -nc --arg c "$change" --arg p "$project" --argjson a "$archived" --argjson o "$tasks_open" \
+      '{change: $c, project: $p, archived: $a, tasks_open: $o}')" \
+    || log "warning: could not record finish event"
+  append_event "$ev" cycle \
+    "$(jq -nc --arg c "$change" --arg p "$project" --arg started_at "$started_at" \
+      --arg finished_at "$(now_iso)" --argjson duration_s "$duration_s" \
+      --argjson retriggers "$retriggers" --argjson blocked_count "$blocked_count" \
+      --argjson waiter_lost "$waiter_lost" --argjson tasks_open "$tasks_open" --argjson archived "$archived" \
+      '{change: $c, project: $p, started_at: $started_at, finished_at: $finished_at, duration_s: $duration_s, retriggers: $retriggers, blocked_count: $blocked_count, waiter_lost: $waiter_lost, tasks_open: $tasks_open, archived: $archived}')" \
+    || log "warning: could not record cycle event"
+
   rm -f "$state_file"
   log "finish: change=$change project=$project"
 
@@ -796,6 +1069,7 @@ main() {
     config-json) shift; config_json "$@" ;;
     dispatch) shift; cmd_dispatch "$@" ;;
     status) shift; cmd_status "$@" ;;
+    review) shift; cmd_review "$@" ;;
     wait) shift; cmd_wait "$@" ;;
     retrigger) shift; cmd_retrigger "$@" ;;
     finish) shift; cmd_finish "$@" ;;

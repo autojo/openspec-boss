@@ -9,12 +9,19 @@ BOSS_CONFIG="${BOSS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/openspec-boss/boss
 BOSS_STATE_DIR="${BOSS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/openspec-boss}"
 BOSS_APPLIES_DIR="$BOSS_STATE_DIR/applies"
 BOSS_LOGS_DIR="$BOSS_STATE_DIR/logs"
+BOSS_CYCLES_DIR="$BOSS_STATE_DIR/cycles"
 
 # --- Tunables ---
 BOSS_AGENT_NAME="${BOSS_AGENT_NAME:-boss}"
 BOSS_WAITER_MAX_S="${BOSS_WAITER_MAX_S:-7200}"
 BOSS_AGENT_START_TIMEOUT_MS="${BOSS_AGENT_START_TIMEOUT_MS:-120000}"
 BOSS_AGENT_BUSY_RETRY_MS="${BOSS_AGENT_BUSY_RETRY_MS:-30000}"
+BOSS_REVIEW_TEST_TIMEOUT_S="${BOSS_REVIEW_TEST_TIMEOUT_S:-300}"
+BOSS_WAITER_STALL_MS="${BOSS_WAITER_STALL_MS:-2700000}"
+
+# Appended to every apply prompt unless the runner overrides or disables it:
+# the apply must end its turn, the boss is woken by the waiter and retriggers.
+BOSS_APPLY_YIELD_DEFAULT="When done or paused, end your turn and stop. Do not wait or poll for a review - the boss is woken automatically and will retrigger you."
 
 # When set (by bin/boss-waiter), log() appends to this file instead of stderr.
 BOSS_LOG_FILE="${BOSS_LOG_FILE:-}"
@@ -108,13 +115,14 @@ one_line() {
   printf '%s' "$1" | tr '\n\r\t' '   ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
 }
 
-# with_note <apply-cmd> <note> -- the text sent to the apply agent
-with_note() {
-  if [ -n "$2" ]; then
-    printf '%s %s' "$1" "$2"
-  else
-    printf '%s' "$1"
-  fi
+# compose_apply_prompt <apply-cmd> <note> <yield> -- the text sent to the
+# apply agent: command, then the note (if any), then the yield instruction
+# (if any). The yield ends the prompt on purpose.
+compose_apply_prompt() {
+  local out="$1"
+  [ -n "$2" ] && out="$out $2"
+  [ -n "$3" ] && out="$out $3"
+  printf '%s' "$out"
 }
 
 # write_state_field <state-file> <key> <string-value> -- atomic update
@@ -134,6 +142,36 @@ state_file_for() {
   local project="$1" change="$2" hash
   hash="$(printf '%s' "$project" | sha1sum | cut -d' ' -f1)"
   printf '%s/%s-%s.json\n' "$BOSS_APPLIES_DIR" "$hash" "$(normalize_name "$change")"
+}
+
+# events_file_for <project-path> <change> -- append-only event log for the
+# applies of this change in this project (same keying as state_file_for).
+events_file_for() {
+  local project="$1" change="$2" hash
+  hash="$(printf '%s' "$project" | sha1sum | cut -d' ' -f1)"
+  printf '%s/%s-%s.events.jsonl\n' "$BOSS_CYCLES_DIR" "$hash" "$(normalize_name "$change")"
+}
+
+# append_event <file> <event> <json-object> -- append one JSONL event line.
+# Adds the timestamp 't'; the object carries change/project and the
+# event-specific fields. The append is a single O_APPEND write, so parallel
+# writers (boss commands and the detached waiter) do not interleave.
+append_event() {
+  local file="$1" event="$2" extra="${3:-{\}}" line
+  [ -n "$file" ] || return 1
+  mkdir -p "$(dirname "$file")" || return 1
+  line="$(jq -nc --arg t "$(now_iso)" --arg event "$event" --argjson extra "$extra" \
+    '{t: $t, event: $event} + $extra')" || return 1
+  printf '%s\n' "$line" >>"$file"
+}
+
+# event_count <file> <event> -- number of events of that name in the log.
+event_count() {
+  local file="$1" name="$2"
+  [ -f "$file" ] || { printf '0\n'; return 0; }
+  jq -Rc --arg e "$name" \
+    'select(length > 0) | (fromjson? | select(type == "object")) | select(.event == $e)' \
+    "$file" 2>/dev/null | wc -l | tr -d ' '
 }
 
 # expand_home <path> -- expand a leading ~
