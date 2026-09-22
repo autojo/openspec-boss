@@ -144,7 +144,7 @@ deliver() {
 }
 
 main() {
-  local out st text dialog
+  local out st text dialog summary
   local -a next_wait=()
   while true; do
     # First round: wait for a settled state. Later rounds: wait for activity
@@ -182,6 +182,19 @@ main() {
       "$(jq -nc --arg c "$change" --arg p "$project" --arg s "$st" '{change: $c, project: $p, state: $s}')" \
       || log "warning: could not record settled event"
 
+    # The last agent output is what the boss needs to judge the result without
+    # digging through logs and diffs. Capped, best effort, never fatal.
+    summary="$(herdr agent read "$agent" --source recent --lines 120 2>/dev/null \
+      | grep -v '^[[:space:]]*$' | tail -n 40 | cut -c1-4000 || true)"
+    if [ -n "$summary" ]; then
+      write_state_field "$state_file" summary "$summary" || log "warning: could not store summary"
+      write_state_field "$state_file" summary_at "$(now_iso)" || true
+      append_event "$events_file" summary \
+        "$(jq -nc --arg c "$change" --arg p "$project" --arg s "$(printf '%s' "$summary" | cut -c1-2000)" \
+          '{change: $c, project: $p, summary: $s}')" \
+        || log "warning: could not record summary event"
+    fi
+
     if [ "$st" = "blocked" ]; then
       dialog="$(herdr agent read "$agent" --source visible 2>/dev/null || true)"
       log "blocked dialog: $dialog"
@@ -195,6 +208,10 @@ main() {
     else
       printf -v text 'Apply %s in %s: %s. Next step: boss status %s' "$change" "$project" "$st" "$change"
       next_wait=(--until working --until blocked)
+    fi
+
+    if [ -n "$summary" ]; then
+      text="$(printf '%s\nLast agent output:\n%s' "$text" "$(printf '%s' "$summary" | cut -c1-1500)")"
     fi
 
     deliver "$text" "$st"

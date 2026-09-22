@@ -94,18 +94,23 @@ boss config-json
   the apply agent to stop at the end of its turn instead of waiting or polling
   for a review – the waiter wakes the boss instead (see `yield` below).
 - `status` shows the agent state, open/done tasks from `tasks.md`,
-  `git status`/`git diff --stat` of the target project and the apply tab; when
-  `blocked`, it also shows the visible dialog. Without a change name, all
-  known applies are listed. `--json` carries everything Herdr knows about the
-  agent: `agent_status` (alias of `agent_state`), `pane` (`pane_id`, `tab_id`,
-  `workspace_id`, `cwd`, `focused`) and `herdr_agent` (the raw agent object,
-  `null` when the agent is gone), plus the stored `note`.
+  `git status`/`git diff --stat` of the target project, the commit range since
+  the apply started and the apply tab; when `blocked`, it also shows the
+  visible dialog. Without a change name, all known applies are listed. `--json`
+  carries everything Herdr knows about the agent: `agent_status` (alias of
+  `agent_state`), `pane` (`pane_id`, `tab_id`, `workspace_id`, `cwd`,
+  `focused`) and `herdr_agent` (the raw agent object, `null` when the agent is
+  gone), plus the stored `note` and the last agent output as `summary`.
 - `review` gathers the deterministic review facts for an apply: task counts,
-  `openspec validate --strict`, a recognizable standard test command
-  (`just test`, `npm test`, `pytest`, `make test`), the git status, and the
-  friction recorded in the event log (retriggers, blocked events, lost
-  waiters, duration, note). It is read-only, does not touch the apply agent and
-  also works after `finish`, when only the event log is left.
+  `openspec validate --strict`, a test command, the commits of the apply and
+  the git working tree, the last agent output as `summary`, and the friction
+  recorded in the event log (retriggers, blocked events, lost waiters,
+  duration, note). The test command comes from the optional `[tests]` config
+  or is detected (`just test`, `pnpm test`/`yarn test`/`npm test`, `uv run
+  pytest`/`poetry run pytest`/`pytest`, `make test`); if none is found or its
+  program is not installed, the result is `not_run` instead of a false `fail`.
+  It is read-only, does not touch the apply agent and also works after
+  `finish`, when only the event log is left.
 - `wait` makes sure a waiter is armed for the apply (starts one if none is
   alive, otherwise reports the running one). Use it after prompting the apply
   agent directly through Herdr.
@@ -157,9 +162,17 @@ apply = "/opsx:apply {change}"
 
 [projects]
 shop = "~/work/shop"
+
+[tests]
+shop = "uv run pytest -q"
 ```
 
-`{change}` is replaced by the change name on dispatch. The `bypassPermissions`
+`{change}` is replaced by the change name on dispatch. The optional `[tests]`
+table overrides the test command `boss review` runs for a project, keyed by the
+registry name. Without an entry, boss detects a standard command from the
+project (`Justfile`, `package.json` with its lockfile, pytest with `uv.lock`/
+`poetry.lock`, `Makefile`); if it finds none – or the program is not installed
+– the review reports `not_run`, not a red test. The `bypassPermissions`
 arguments of the claude runner are a deliberate choice: an apply without a
 human at the tab would otherwise stall on every permission prompt. If you
 don't want that, delete the `args` line in `boss.toml`.

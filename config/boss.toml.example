@@ -26,3 +26,10 @@ apply = "/opsx:apply {change}"
 [projects]
 shop = "~/work/shop"
 api = "~/work/api"
+
+# Optional: the test command 'boss review' runs per project, keyed by the
+# registry name. Without an entry boss detects one from the project (Justfile,
+# package.json + lockfile, pytest with uv.lock/poetry.lock, Makefile); if it
+# finds none, the review reports not_run instead of a false fail.
+[tests]
+shop = "uv run pytest -q"

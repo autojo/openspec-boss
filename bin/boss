@@ -609,17 +609,20 @@ cmd_dispatch() {
   herdr_raw "pane.report_metadata" "$(jq -nc --arg p "$pane_id" --arg c "$change" \
     '{pane_id: $p, source: "openspec", tokens: {os_change: $c, os_phase: "apply"}}')" >/dev/null || exit 1
 
-  local state_file now runner_name_out
+  local state_file now runner_name_out base_head
   state_file="$(state_file_for "$project" "$change")"
   now="$(now_iso)"
   runner_name_out="$(printf '%s' "$runner" | jq -r '.name')"
+  # Anchor for the apply's commit range: the HEAD the apply starts from.
+  base_head="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
   mkdir -p "$BOSS_APPLIES_DIR" || die_json "state_write" "cannot create state dir $BOSS_APPLIES_DIR"
   jq -n \
     --arg change "$change" --arg project "$project" --arg runner "$runner_name_out" \
     --arg kind "$kind" --arg apply_cmd "$apply_cmd" --arg note "$note" --arg yield "$runner_yield" --arg agent "$agent_name" \
     --arg pane_id "$pane_id" --arg tab_id "$tab_id" --arg workspace_id "$workspace_id" --arg boss "$dispatcher_boss" \
+    --arg base_head "$base_head" \
     --arg started_at "$now" --arg last_state "working" --arg last_state_at "$now" \
-    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, boss: $boss, waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at}' \
+    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, boss: $boss, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at}' \
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"
 
   setsid -f "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1
@@ -721,6 +724,17 @@ status_one() {
   changed_files="$(git -C "$project" status --short 2>/dev/null || true)"
   diff_stat="$(git -C "$project" diff --stat 2>/dev/null || true)"
 
+  local base_head commits diff_stat_range summary
+  base_head="$(git_range_base "$project" "$(jq -r '.base_head // empty' "$state_file")")"
+  commits=""
+  diff_stat_range=""
+  if [ -n "$base_head" ]; then
+    commits="$(git -C "$project" log --oneline "$base_head..HEAD" 2>/dev/null || true)"
+    diff_stat_range="$(git -C "$project" diff --stat "$base_head..HEAD" 2>/dev/null || true)"
+  fi
+  summary="$(jq -r '.summary // empty' "$state_file")"
+  [ -n "$summary" ] || summary="$(last_event_field "$(events_file_for "$project" "$change")" summary summary)"
+
   local dialog=""
   if [ "$agent_state" = "blocked" ]; then
     dialog="$(herdr agent read "$pane_id" --source visible 2>/dev/null || true)"
@@ -735,7 +749,11 @@ status_one() {
     --argjson herdr_agent "$herdr_agent" --argjson pane "$pane_json" --arg note "$(jq -r '.note // ""' "$state_file")" \
     --argjson changed_files "$(printf '%s' "$changed_files" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --argjson diff_stat "$(printf '%s' "$diff_stat" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, pane: $pane, herdr_agent: $herdr_agent, note: (if $note == "" then null else $note end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, git: {changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end)}')"
+    --arg base_head "$base_head" \
+    --argjson commits "$(printf '%s' "$commits" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    --argjson diff_stat_range "$(printf '%s' "$diff_stat_range" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    --arg summary "$summary" \
+    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, pane: $pane, herdr_agent: $herdr_agent, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end)}')"
 
   if [ "$json_only" -eq 1 ]; then
     printf '%s\n' "$json"
@@ -750,6 +768,12 @@ status_one() {
     printf 'tasks: missing (no tasks.md)\n'
   else
     printf 'tasks: %s open, %s done\n' "$(printf '%s' "$tasks_json" | jq -r '.open')" "$(printf '%s' "$tasks_json" | jq -r '.done')"
+  fi
+  if [ -n "$summary" ]; then
+    printf 'summary (last agent output):\n%s\n' "$summary"
+  fi
+  if [ -n "$commits" ]; then
+    printf 'git log --oneline %s..HEAD:\n%s\n' "$base_head" "$commits"
   fi
   if [ -n "$changed_files" ]; then
     printf 'git status --short:\n%s\n' "$changed_files"
@@ -867,9 +891,26 @@ review_locate() {
   printf '%s\t%s\t%s\n' "$project" "$evs" ""
 }
 
+# config_test_command <project> -- the [tests] override for the registered
+# project whose path resolves to <project>, or empty. The registry maps a name
+# to a path, so the override is keyed by that name.
+config_test_command() {
+  local project="$1" cfg name path
+  cfg="$(config_json)" || exit 1
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    path="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.projects[$n] // empty')"
+    [ -n "$path" ] || continue
+    if [ "$(canonical_path "$path")" = "$project" ]; then
+      printf '%s' "$(printf '%s' "$cfg" | jq -r --arg n "$name" '.tests[$n] // empty')"
+      return 0
+    fi
+  done < <(printf '%s' "$cfg" | jq -r '(.tests // {}) | keys[]')
+}
+
 # detect_test_command <project> -- a recognizable standard test command, or empty
 detect_test_command() {
-  local project="$1" jf=""
+  local project="$1" jf="" runner=""
   [ -f "$project/Justfile" ] && jf="$project/Justfile"
   [ -z "$jf" ] && [ -f "$project/justfile" ] && jf="$project/justfile"
   if [ -n "$jf" ] && grep -qE '^[[:space:]]*test[[:space:]]*:' "$jf" 2>/dev/null; then
@@ -877,12 +918,26 @@ detect_test_command() {
     return 0
   fi
   if [ -f "$project/package.json" ] && jq -e '.scripts.test' "$project/package.json" >/dev/null 2>&1; then
-    printf 'npm test'
+    if [ -f "$project/pnpm-lock.yaml" ]; then
+      runner="pnpm test"
+    elif [ -f "$project/yarn.lock" ]; then
+      runner="yarn test"
+    else
+      runner="npm test"
+    fi
+    printf '%s' "$runner"
     return 0
   fi
   if [ -f "$project/pytest.ini" ] || [ -f "$project/tox.ini" ] \
     || { [ -f "$project/pyproject.toml" ] && grep -q 'pytest' "$project/pyproject.toml" 2>/dev/null; }; then
-    printf 'pytest'
+    if [ -f "$project/uv.lock" ]; then
+      runner="uv run pytest"
+    elif [ -f "$project/poetry.lock" ]; then
+      runner="poetry run pytest"
+    else
+      runner="pytest"
+    fi
+    printf '%s' "$runner"
     return 0
   fi
   if [ -f "$project/Makefile" ] && grep -qE '^test:' "$project/Makefile" 2>/dev/null; then
@@ -935,7 +990,14 @@ cmd_review() {
   fi
 
   local test_cmd test_result="not_run"
-  test_cmd="$(detect_test_command "$project")"
+  test_cmd="$(config_test_command "$project")"
+  [ -n "$test_cmd" ] || test_cmd="$(detect_test_command "$project")"
+  # A command whose program is not installed did not run and must not read as
+  # a red test: drop it and report not_run instead.
+  if [ -n "$test_cmd" ] && ! command -v "${test_cmd%% *}" >/dev/null 2>&1; then
+    log "test command '$test_cmd' not found in PATH; reporting not_run"
+    test_cmd=""
+  fi
   if [ -n "$test_cmd" ] && command -v timeout >/dev/null 2>&1; then
     if (cd "$project" && timeout "$BOSS_REVIEW_TEST_TIMEOUT_S" bash -c "$test_cmd" >/dev/null 2>&1); then
       test_result="pass"
@@ -947,6 +1009,22 @@ cmd_review() {
   local changed_files diff_stat
   changed_files="$(git -C "$project" status --short 2>/dev/null || true)"
   diff_stat="$(git -C "$project" diff --stat 2>/dev/null || true)"
+
+  local base_head="" commits="" diff_stat_range=""
+  if [ -n "$state_file" ] && [ -f "$state_file" ]; then
+    base_head="$(git_range_base "$project" "$(jq -r '.base_head // empty' "$state_file")")"
+  fi
+  if [ -n "$base_head" ]; then
+    commits="$(git -C "$project" log --oneline "$base_head..HEAD" 2>/dev/null || true)"
+    diff_stat_range="$(git -C "$project" diff --stat "$base_head..HEAD" 2>/dev/null || true)"
+  fi
+
+  local summary
+  summary=""
+  if [ -n "$state_file" ] && [ -f "$state_file" ]; then
+    summary="$(jq -r '.summary // empty' "$state_file")"
+  fi
+  [ -n "$summary" ] || summary="$(last_event_field "$ev" summary summary)"
 
   local retriggers blocked_count waiter_lost duration_s note started_at started_epoch
   retriggers="$(event_count "$ev" retrigger)"
@@ -971,12 +1049,18 @@ cmd_review() {
     --arg test_result "$test_result" --arg test_cmd "$test_cmd" \
     --argjson changed_files "$(printf '%s' "$changed_files" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --argjson diff_stat "$(printf '%s' "$diff_stat" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    --arg base_head "$base_head" \
+    --argjson commits "$(printf '%s' "$commits" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    --argjson diff_stat_range "$(printf '%s' "$diff_stat_range" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    --arg summary "$summary" \
     --argjson retriggers "$retriggers" --argjson blocked_count "$blocked_count" \
     --argjson waiter_lost "$waiter_lost" --argjson duration_s "$duration_s" --arg note "$note" \
-    '{change: $change, project: $project,
+    '{change: $change, project: $project, summary: (if $summary == "" then null else $summary end),
       quality: {tasks: $tasks, validate: $validate,
         tests: {result: $test_result, command: (if $test_cmd == "" then null else $test_cmd end)},
-        git: {changed_files: $changed_files, diff_stat: $diff_stat}},
+        git: {base_head: (if $base_head == "" then null else $base_head end),
+          commits: $commits, diff_stat_range: $diff_stat_range,
+          changed_files: $changed_files, diff_stat: $diff_stat}},
       friction: {retriggers: $retriggers, blocked_count: $blocked_count,
         waiter_lost: $waiter_lost, duration_s: $duration_s,
         note: (if $note == "" then null else $note end)}}')"
@@ -1000,6 +1084,12 @@ cmd_review() {
     printf 'tests: %s (no standard command recognized)\n' "$test_result"
   fi
   printf 'friction: %s retrigger(s), %s blocked, waiter_lost=%s\n' "$retriggers" "$blocked_count" "$waiter_lost"
+  if [ -n "$summary" ]; then
+    printf 'summary (last agent output):\n%s\n' "$summary"
+  fi
+  if [ -n "$commits" ]; then
+    printf 'git log --oneline %s..HEAD:\n%s\n' "$base_head" "$commits"
+  fi
   if [ -n "$changed_files" ]; then
     printf 'git status --short:\n%s\n' "$changed_files"
   else
@@ -1091,6 +1181,13 @@ cmd_retrigger() {
     write_state_field "$state_file" note "$note"
   else
     note="$(jq -r '.note // ""' "$state_file")"
+  fi
+
+  # State files from before the commit range: set the base, never move it.
+  if [ -z "$(jq -r '.base_head // empty' "$state_file")" ]; then
+    local base_head
+    base_head="$(git -C "$project" rev-parse HEAD 2>/dev/null || true)"
+    [ -n "$base_head" ] && write_state_field "$state_file" base_head "$base_head"
   fi
 
   if ! herdr agent get "$pane_id" >/dev/null 2>&1; then

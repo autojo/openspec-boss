@@ -30,20 +30,31 @@ finishes.
    if it stays that way longer than `BOSS_WAITER_STALL_MS` (default 45 min), the
    waiter sends you a "still working" notice, no action required.
 3. **Being woken** – the waiter reports completion to you as a prompt, e.g.
-   `Apply add-auth in ~/work/shop: done. Next step: boss status add-auth`. If
-   the prompt arrives while you are working, it is queued – handle it after
-   the current turn. The waiter stays armed: every time the apply agent
-   returns to a settled state after being prompted again (`boss retrigger`,
-   `boss answer`, or a direct `herdr agent prompt`), you are woken again. If
-   you prompted the agent directly and are unsure a waiter is alive, run
-   `boss wait <change>`.
+   `Apply add-auth in ~/work/shop: done. Last agent output: … Next step:
+   boss status add-auth`; the agent's last output is already attached, you do
+   not have to reconstruct it from logs and diffs. If the prompt arrives while
+   you are working, it is queued – handle it after the current turn.
+   `done` and `idle` both mean "the apply ended its turn": `done` is the
+   explicit completion signal, `idle` means the agent is back at its prompt
+   (for example after a yield without a final signal). Neither means the
+   change is finished – the review decides that, and you react to both the
+   same way. The waiter stays armed: every time the apply agent returns to a
+   settled state after being prompted again (`boss retrigger`, `boss answer`,
+   or a direct `herdr agent prompt`), you are woken again. If you prompted the
+   agent directly and are unsure a waiter is alive, run `boss wait <change>`.
 4. **Review** – `boss review <change> --json` gathers the deterministic
-   facts (tasks, `openspec validate`, recognizable tests, git) and the
-   friction from the event log. Check:
+   facts (tasks, `openspec validate`, tests, git) and the friction from the
+   event log. Check:
    - `quality.tasks.open == 0`?
    - `quality.validate == "pass"`?
-   - `quality.tests.result` is `pass` or `not_run` (not `fail`)?
+   - `quality.tests.result` is `pass` or `not_run` (not `fail`)? A `not_run`
+     means no test command was found or its program is missing – look yourself.
+   - `quality.git.commits` and `quality.git.diff_stat_range` show what the
+     apply committed since it started (the agent may commit its work);
+     `quality.git.changed_files` is only the remaining working tree.
    - diff plausible? Read the changed files yourself (in the target project).
+   - `summary` (also in `boss status`) is the last agent output – a starting
+     point, not a replacement for reading the diff.
    - `friction.retriggers` / `friction.blocked_count` show how bumpy the run
      was – a reason to look closer, not a failure by itself.
    - in Claude Code optionally: `/code-review` on the diff.

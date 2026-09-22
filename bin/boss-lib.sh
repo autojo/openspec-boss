@@ -361,6 +361,29 @@ event_count() {
     "$file" 2>/dev/null | wc -l | tr -d ' '
 }
 
+# git_range_base <project> <base-head> -- print <base-head> when it is a commit
+# in <project> and an ancestor of HEAD, otherwise nothing. Used to guard the
+# apply's commit range.
+git_range_base() {
+  local project="$1" base="${2:-}"
+  [ -n "$base" ] || return 0
+  git -C "$project" cat-file -e "${base}^{commit}" 2>/dev/null || return 0
+  git -C "$project" merge-base --is-ancestor "$base" HEAD 2>/dev/null || return 0
+  printf '%s' "$base"
+}
+
+# last_event_field <file> <event> <field> -- value of <field> in the last event
+# of that name (may be multi-line), or nothing. Skips malformed lines.
+last_event_field() {
+  local file="$1" event="$2" field="$3"
+  [ -f "$file" ] || return 0
+  jq -Rrc --arg e "$event" --arg f "$field" \
+    'split("\n")
+     | map(select(length > 0) | (fromjson? | select(type == "object" and .event == $e)))
+     | map(.[$f] // empty)
+     | last // empty' "$file" 2>/dev/null || true
+}
+
 # expand_home <path> -- expand a leading ~
 expand_home() {
   case "$1" in
