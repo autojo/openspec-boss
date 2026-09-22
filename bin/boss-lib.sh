@@ -375,6 +375,21 @@ git_range_base() {
   printf '%s' "$base"
 }
 
+# event_count_since_dispatch <file> <event> -- number of events of that name
+# that belong to the current apply run, i.e. occurred at or after the last
+# 'dispatch' event. Without a dispatch event the whole log is counted (same as
+# event_count), so logs from before the event log keep working.
+event_count_since_dispatch() {
+  local file="$1" name="$2"
+  [ -f "$file" ] || { printf '0\n'; return 0; }
+  jq -Rsc --arg e "$name" \
+    'split("\n")
+     | map(select(length > 0) | (fromjson? | select(type == "object")))
+     | (map(select(.event == "dispatch")) | last) as $d
+     | [ .[] | select(.event == $e) | select($d == null or (.t // "") >= ($d.t // "")) ] | length' \
+    "$file" 2>/dev/null || printf '0\n'
+}
+
 # last_event_field <file> <event> <field> -- value of <field> in the last event
 # of that name (may be multi-line), or nothing. Skips malformed lines.
 last_event_field() {

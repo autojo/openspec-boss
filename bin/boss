@@ -584,6 +584,13 @@ cmd_dispatch() {
   check_apply_ready "$project" "$change"
   agent_name="$(apply_agent_name "$change")"
 
+  local project_registered=true hint=""
+  if ! is_project_registered "$project"; then
+    project_registered=false
+    hint="project '$project' is not registered in $BOSS_CONFIG; add it under [projects] to address it by name"
+    log "warning: $hint"
+  fi
+
   local existing pane_id tab_id workspace_id
   existing="$(find_running_apply "$change" "$project")"
   if [ -n "$existing" ] && [ "$existing" != "null" ]; then
@@ -595,7 +602,8 @@ cmd_dispatch() {
       --arg runner "$(printf '%s' "$runner" | jq -r '.name')" \
       --arg agent "$agent_name" --arg pane_id "$pane_id" --arg tab_id "$tab_id" \
       --arg workspace_id "$workspace_id" --arg status "already_running" \
-      '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, status: $status}')"
+      --argjson project_registered "$project_registered" --arg hint "$hint" \
+      '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, status: $status, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end)}')"
     return 0
   fi
 
@@ -692,7 +700,8 @@ cmd_dispatch() {
     --arg change "$change" --arg project "$project" --arg runner "$runner_name_out" \
     --arg agent "$agent_name" --arg pane_id "$pane_id" --arg tab_id "$tab_id" \
     --arg workspace_id "$workspace_id" --arg status "started" \
-    '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, status: $status}')"
+    --argjson project_registered "$project_registered" --arg hint "$hint" \
+    '{change: $change, project: $project, runner: $runner, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, status: $status, project_registered: $project_registered, hint: (if $hint == "" then null else $hint end)}')"
 }
 
 # ------------------------------------------------------------------ state ---
@@ -945,6 +954,19 @@ review_locate() {
   printf '%s\t%s\t%s\n' "$project" "$evs" ""
 }
 
+# is_project_registered <project> -- 0 when the canonical path is in the
+# [projects] registry (by any name).
+is_project_registered() {
+  local project="$1" cfg name path
+  cfg="$(config_json)" || exit 1
+  while IFS= read -r name; do
+    path="$(printf '%s' "$cfg" | jq -r --arg n "$name" '.projects[$n] // empty')"
+    [ -n "$path" ] || continue
+    [ "$(canonical_path "$path")" = "$project" ] && return 0
+  done < <(printf '%s' "$cfg" | jq -r '(.projects // {}) | keys[]')
+  return 1
+}
+
 # config_test_command <project> -- the [tests] override for the registered
 # project whose path resolves to <project>, or empty. The registry maps a name
 # to a path, so the override is keyed by that name.
@@ -1081,10 +1103,10 @@ cmd_review() {
   [ -n "$summary" ] || summary="$(last_event_field "$ev" summary summary)"
 
   local retriggers blocked_count waiter_lost duration_s note started_at started_epoch
-  retriggers="$(event_count "$ev" retrigger)"
-  blocked_count="$(event_count "$ev" blocked)"
+  retriggers="$(event_count_since_dispatch "$ev" retrigger)"
+  blocked_count="$(event_count_since_dispatch "$ev" blocked)"
   waiter_lost=false
-  [ "$(event_count "$ev" lost)" -gt 0 ] && waiter_lost=true
+  [ "$(event_count_since_dispatch "$ev" lost)" -gt 0 ] && waiter_lost=true
   note=""
   duration_s=null
   if [ -n "$state_file" ] && [ -f "$state_file" ]; then
@@ -1323,10 +1345,10 @@ cmd_finish() {
   # disappears: append the raw finish event and one aggregated cycle record.
   local ev retriggers blocked_count waiter_lost duration_s tasks_open started_at tasks_file
   ev="$(events_file_for "$project" "$change")"
-  retriggers="$(event_count "$ev" retrigger)"
-  blocked_count="$(event_count "$ev" blocked)"
+  retriggers="$(event_count_since_dispatch "$ev" retrigger)"
+  blocked_count="$(event_count_since_dispatch "$ev" blocked)"
   waiter_lost=false
-  [ "$(event_count "$ev" lost)" -gt 0 ] && waiter_lost=true
+  [ "$(event_count_since_dispatch "$ev" lost)" -gt 0 ] && waiter_lost=true
   started_at="$(jq -r '.started_at // ""' "$state_file")"
   duration_s=null
   if [ -n "$started_at" ]; then

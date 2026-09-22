@@ -22,7 +22,10 @@ finishes.
 2. **Dispatch** – once all artifacts of the change are ready:
    `boss dispatch <change> --project <name|path> [--runner <name>] [--note "<text>"]`.
    Use `--note` to hand the apply agent context it cannot know (a real case
-   to test against, which tool to use for a check, who reviews). The JSON
+   to test against, which tool to use for a check, who reviews). Durable facts
+   – URLs, measurements, external formats – belong in the change artifacts
+   (proposal/specs/tasks), not in the note; keep the note for what the agent
+   cannot learn from the artifacts. The JSON
    result contains agent, pane and tab. You do not switch into the apply
    tab; the apply agent works there on its own. Every apply prompt ends with a
    yield instruction: the apply stops at the end of its turn and does not wait
@@ -56,8 +59,21 @@ finishes.
    - `summary` (also in `boss status`) is the last agent output – a starting
      point, not a replacement for reading the diff.
    - `friction.retriggers` / `friction.blocked_count` show how bumpy the run
-     was – a reason to look closer, not a failure by itself.
+     was – a reason to look closer, not a failure by itself. They are counted
+     per apply run (since the last `dispatch`).
    - in Claude Code optionally: `/code-review` on the diff.
+
+   A green diff and checked-off tasks are not enough – the expensive mistakes
+   live outside the diff. Also check:
+   - **Claims with an outside reference** – URLs, IDs, external formats the
+     apply agent could not know – verify a sample yourself. Invented source
+     URLs look fine in the diff and in a green test run.
+   - **Runtime state** for daemons and services: is the process actually
+     running, is the data store filling, what does the log say? A worker that
+     never started leaves every task checked off.
+   - **Checked off is not done**: a task whose verification is "after N
+     minutes/hours" or "by a human" is not done without that proof;
+     hand-written fixtures do not count as "from the archive".
    `boss status <change>` still shows the live agent state and the apply tab.
 5. **Fix** – if the review finds problems: correct proposal/specs in the
    target project with your tool's update command (Claude Code:
@@ -67,7 +83,11 @@ finishes.
    completion.
 6. **Finish** – if the review passes: `boss finish <change>` closes the
    apply tab and cleans up; it needs the agent to be settled, nothing else.
-   Archiving is a separate decision: run `/opsx:sync <change>` or
+   After `finish` the apply agent is gone: further work on the same change
+   means a new `boss dispatch <change>` (not `retrigger`, which needs the old
+   agent). A new dispatch starts a fresh run – the retrigger counter and the
+   commit base (`base_head`) are reset. Archiving is a separate decision: run
+   `/opsx:sync <change>` or
    `/opsx-sync <change>`, or `/opsx:archive <change>` or
    `/opsx-archive <change>` in the target project (Claude Code with `:`,
    OpenCode without) when the change can be archived – that may be before
