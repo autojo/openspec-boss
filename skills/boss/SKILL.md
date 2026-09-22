@@ -25,7 +25,9 @@ finishes.
    to test against, which tool to use for a check, who reviews). Durable facts
    – URLs, measurements, external formats – belong in the change artifacts
    (proposal/specs/tasks), not in the note; keep the note for what the agent
-   cannot learn from the artifacts. The JSON
+   cannot learn from the artifacts. Runner-wide expectations, above all
+   whether the apply commits its work, belong in the runner's `apply` template
+   in `boss.toml`, not in the note. The JSON
    result contains agent, pane and tab. You do not switch into the apply
    tab; the apply agent works there on its own. Every apply prompt ends with a
    yield instruction: the apply stops at the end of its turn and does not wait
@@ -53,8 +55,10 @@ finishes.
    - `quality.tests.result` is `pass` or `not_run` (not `fail`)? A `not_run`
      means no test command was found or its program is missing – look yourself.
    - `quality.git.commits` and `quality.git.diff_stat_range` show what the
-     apply committed since it started (the agent may commit its work);
-     `quality.git.changed_files` is only the remaining working tree.
+     apply committed since it started; `quality.git.changed_files` is the
+     remaining working tree. Whether the apply commits depends on the runner
+     (claude tends to commit, opencode to leave the working tree) – if it did
+     not commit, you decide about the working tree before finishing.
    - diff plausible? Read the changed files yourself (in the target project).
    - `summary` (also in `boss status`) is the last agent output – a starting
      point, not a replacement for reading the diff.

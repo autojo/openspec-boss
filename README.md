@@ -172,7 +172,15 @@ table overrides the test command `boss review` runs for a project, keyed by the
 registry name. Without an entry, boss detects a standard command from the
 project (`Justfile`, `package.json` with its lockfile, pytest with `uv.lock`/
 `poetry.lock`, `Makefile`); if it finds none – or the program is not installed
-– the review reports `not_run`, not a red test. The `bypassPermissions`
+– the review reports `not_run`, not a red test.
+
+The `apply` template may carry more than the OpenSpec command: any free text is
+sent to the agent along with it, before the note and the yield instruction. That
+is the place for a runner-wide expectation such as **whether the apply should
+commit its work** – whether an apply commits depends on the runner (claude tends
+to commit, opencode to leave the working tree). State it once here instead of
+repeating it in every `--note`; the review shows the difference as
+`git.commits` versus `git.changed_files`. The `bypassPermissions`
 arguments of the claude runner are a deliberate choice: an apply without a
 human at the tab would otherwise stall on every permission prompt. If you
 don't want that, delete the `args` line in `boss.toml`.

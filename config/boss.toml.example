@@ -7,7 +7,10 @@ default = "opencode"
 [runners.opencode]
 kind = "opencode"
 args = []
-apply = "/opsx-apply {change}"
+# The apply template matches the runner's habit: opencode applies tend to leave
+# their work uncommitted, so ask for that explicitly and let the boss review the
+# working tree. claude tends to commit, so ask it to commit (see below).
+apply = "/opsx-apply {change} Leave the changed files uncommitted for review."
 # Optional: environment variables set for the tab this runner is started in.
 # Without the field an opencode runner gets the built-in default
 # OPENCODE_CONFIG_CONTENT={"permission":"allow"}, which grants allow-all only
@@ -21,7 +24,10 @@ apply = "/opsx-apply {change}"
 [runners.claude]
 kind = "claude"
 args = ["--permission-mode", "bypassPermissions"]
-apply = "/opsx:apply {change}"
+# Whether an apply commits depends on the runner; state the expectation here,
+# once, instead of repeating it in every --note. Free text after the command is
+# sent to the agent along with it.
+apply = "/opsx:apply {change} Commit your work with a clear message when done."
 # Optional: wait for this text in the pane before the first prompt, so a cold
 # start cannot produce agent_prompt_stalled. ready_regex = true treats the
 # value as a Rust regex; ready_timeout_ms defaults to 90000 (raise it on slow

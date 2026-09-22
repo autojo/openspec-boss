@@ -102,6 +102,9 @@ ensure_config() {
     printf '%s\n' "# default: runner used when none is given on the command line."
     printf '%s\n' "# [runners.<name>]: kind = agent kind, args = extra agent start arguments,"
     printf '%s\n' "#                  apply = OpenSpec apply command template ({change} is replaced)."
+    printf '%s\n' "#                  The template may carry more than the command: free text is sent"
+    printf '%s\n' "#                  to the agent as well, e.g. its commit expectation. Put runner-wide"
+    printf '%s\n' "#                  instructions here, not in every --note."
     printf '%s\n' "# [projects]: name -> repo path (absolute or ~), so projects can be addressed by name."
     printf 'default = "%s"\n' "$default_runner"
     for kind in $found; do
@@ -112,6 +115,8 @@ ensure_config() {
       else
         printf 'args = []\n'
       fi
+      printf '# apply may carry runner-wide instructions after the command, e.g. whether\n'
+      printf '# the agent should commit its work: apply = "… Commit when done."\n'
       printf 'apply = "%s"\n' "$(apply_template_for "$kind")"
     done
     printf '\n[projects]\n'
