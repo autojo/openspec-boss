@@ -187,6 +187,18 @@ every OpenCode session on the machine. A custom `env` replaces the default,
 (claude keeps `--permission-mode bypassPermissions`). Existing configurations
 without the field stay valid.
 
+A runner may carry readiness and first-run dialog fields. `ready` (with
+optional `ready_regex = true` and `ready_timeout_ms`, default 90000) makes boss
+wait with `herdr pane wait-output` for that marker in the pane before sending
+the first prompt – this is what keeps a cold start on a slow host from
+producing `agent_prompt_stalled`. Without `ready`, boss waits for the agent's
+`idle` state and retries the prompt with growing backoff for up to
+`BOSS_AGENT_PROMPT_TIMEOUT_MS` (default 90000). `dialog_match` + `dialog_keys`
+answers a first-run dialog automatically: with `--permission-mode
+bypassPermissions` claude shows a consent prompt on its first start, which you
+otherwise accept once by hand. Example: `dialog_match = "Yes, I accept"`,
+`dialog_keys = ["enter"]`.
+
 A runner may carry an optional `yield` string: the instruction appended to
 every apply prompt (and reused by `retrigger`). Without the field the built-in
 default is used ("end your turn, do not wait or poll for a review"); `yield = ""`

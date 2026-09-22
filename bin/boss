@@ -387,6 +387,9 @@ cmd_session() {
     die_json "agent_not_ready" "$msg (pane $pane_id, tab $tab_id closed)"
   fi
 
+  # Same readiness rule as dispatch, so a first-run dialog cannot wedge the tab.
+  await_runner_ready "$agent_name" "$pane_id" "$runner"
+
   local claim
   claim="$(boss_claim_pane "$workspace_id" "$pane_id" "$agent_name")" || exit 1
   agent_name="$(printf '%s' "$claim" | jq -r '.agent // empty')"
@@ -472,12 +475,62 @@ find_running_apply() {
   printf '%s' "$hit"
 }
 
+# await_runner_ready <agent> <pane> <runner-json> -- wait until the runner's
+# TUI can take input before the first prompt: settle to idle, honour an
+# optional `ready` marker (pane wait-output on a cold start) and answer an
+# optional first-run dialog (e.g. claude's bypassPermissions consent). Dies
+# with agent_not_ready; the caller has set BOSS_FAILED_TAB, so the tab closes.
+await_runner_ready() {
+  local agent="$1" pane="$2" runner="$3" out rc code
+  if ! out="$(herdr agent wait "$agent" --until idle --timeout "$BOSS_AGENT_TUI_TIMEOUT_MS" 2>&1)"; then
+    code="$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null || true)"
+    die_json "agent_not_ready" "agent '$agent' not ready before prompting ($code; pane $pane)"
+  fi
+
+  local ready regex timeout
+  ready="$(printf '%s' "$runner" | jq -r '.ready // empty')"
+  if [ -n "$ready" ]; then
+    regex="$(printf '%s' "$runner" | jq -r 'if .ready_regex == true then "1" else "" end')"
+    timeout="$(printf '%s' "$runner" | jq -r --argjson d "$BOSS_RUNNER_READY_TIMEOUT_MS" '.ready_timeout_ms // $d')"
+    if [ -n "$regex" ]; then
+      out="$(herdr pane wait-output --regex "$ready" --timeout "$timeout" "$pane" 2>&1)"
+    else
+      out="$(herdr pane wait-output --match "$ready" --timeout "$timeout" "$pane" 2>&1)"
+    fi
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      code="$(printf '%s' "$out" | jq -r '.error.code // "timeout"' 2>/dev/null || true)"
+      die_json "agent_not_ready" "runner ready marker '$ready' not seen within ${timeout}ms ($code; pane $pane)"
+    fi
+  fi
+
+  local match
+  match="$(printf '%s' "$runner" | jq -r '.dialog_match // empty')"
+  if [ -n "$match" ]; then
+    local -a keys=()
+    while IFS= read -r k; do [ -n "$k" ] && keys+=("$k"); done < <(printf '%s' "$runner" | jq -r '.dialog_keys[]? // empty')
+    if [ "${#keys[@]}" -gt 0 ]; then
+      local i visible
+      for i in 1 2 3; do
+        visible="$(herdr pane read "$pane" --source visible --lines 30 2>/dev/null || true)"
+        printf '%s' "$visible" | grep -qF -- "$match" || break
+        herdr agent send-keys "$agent" "${keys[@]}" >/dev/null 2>&1 || true
+        log "answered a runner dialog matching '$match'"
+        sleep 1
+      done
+    fi
+  fi
+}
+
 # send_prompt <agent> <text> -- deliver a prompt and verify it took effect:
 # herdr reports agent_prompt_stalled when the input did not lead to a working
-# agent (e.g. the TUI was still booting), in which case we resend.
+# agent (e.g. the TUI was still booting); retry with backoff until the budget
+# BOSS_AGENT_PROMPT_TIMEOUT_MS is used up.
 send_prompt() {
-  local agent="$1" text="$2" attempt out rc code
-  for attempt in 1 2 3; do
+  local agent="$1" text="$2" out rc code deadline wait_s now
+  deadline=$(( $(date +%s%3N) + BOSS_AGENT_PROMPT_TIMEOUT_MS ))
+  wait_s=2
+  while :; do
     out="$(herdr agent prompt "$agent" "$text" --wait --until working --timeout 30000 2>&1)"
     rc=$?
     if [ "$rc" -eq 0 ]; then
@@ -486,15 +539,19 @@ send_prompt() {
     code="$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null || true)"
     case "$code" in
       agent_prompt_stalled|timeout)
-        log "prompt did not take effect yet ($code); retrying (attempt $attempt)"
-        sleep 2
+        now="$(date +%s%3N)"
+        [ "$now" -lt "$deadline" ] || break
+        log "prompt did not take effect yet ($code); retrying in ${wait_s}s"
+        sleep "$wait_s"
+        wait_s=$(( wait_s * 2 ))
+        [ "$wait_s" -gt 15 ] && wait_s=15
         ;;
       *)
         die_json "prompt_failed" "sending prompt to $agent failed: $code"
         ;;
     esac
   done
-  die_json "prompt_failed" "prompt did not take effect for $agent after 3 attempts"
+  die_json "prompt_failed" "prompt did not take effect for $agent within $(( BOSS_AGENT_PROMPT_TIMEOUT_MS / 1000 ))s"
 }
 
 # ---------------------------------------------------------------- dispatch ---
@@ -595,11 +652,8 @@ cmd_dispatch() {
     die_json "agent_not_ready" "$msg (pane $pane_id, tab $tab_id closed)"
   fi
 
-  # Wait until the agent TUI is rendered before prompting.
-  if ! out="$(herdr agent wait "$agent_name" --until idle --timeout 60000 2>&1)"; then
-    code="$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null || true)"
-    die_json "agent_not_ready" "agent '$agent_name' not ready before prompting ($code; pane $pane_id, tab $tab_id closed)"
-  fi
+  # Wait until the agent TUI can take input before prompting.
+  await_runner_ready "$agent_name" "$pane_id" "$runner"
 
   apply_cmd="${apply_template/\{change\}/$change}"
   local runner_yield

@@ -22,6 +22,18 @@ apply = "/opsx-apply {change}"
 kind = "claude"
 args = ["--permission-mode", "bypassPermissions"]
 apply = "/opsx:apply {change}"
+# Optional: wait for this text in the pane before the first prompt, so a cold
+# start cannot produce agent_prompt_stalled. ready_regex = true treats the
+# value as a Rust regex; ready_timeout_ms defaults to 90000 (raise it on slow
+# hosts). Without the field boss does not wait for a marker.
+# ready = "? for shortcuts"
+# ready_regex = false
+# ready_timeout_ms = 90000
+# Optional: answer a first-run dialog with these keys. With
+# --permission-mode bypassPermissions claude shows a consent prompt on its
+# first start; accept it once manually, or let boss do it here.
+# dialog_match = "Yes, I accept"
+# dialog_keys = ["enter"]
 
 [projects]
 shop = "~/work/shop"
