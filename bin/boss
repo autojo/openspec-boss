@@ -20,6 +20,7 @@ Usage:
   boss retrigger <change> [--project <name|path>] [--note <text>]
   boss finish <change> [--project <name|path>] [--force] [--lesson <text>] [--lesson-scope project|global]
   boss answer <change> <key>... [--project <name|path>]
+  boss skills dir [--project <name|path>] [--json]
   boss claim [--name <name>] [--release]
   boss session [--project <name|path>] [--runner <name>]
   boss mission start <slug> --project <name|path>
@@ -1628,6 +1629,78 @@ cmd_answer() {
     '{change: $change, agent: $agent, keys: $keys, status: $status}')"
 }
 
+# ------------------------------------------------------------------ skills ---
+
+# skills_dirs_json [<project>] -- the skill directories of both tools as compact
+# JSON: the project-scoped ones (opencode plus claude) when a project is given,
+# and the machine-global ones. A leading ~ is expanded, so all paths absolute.
+# A skill is plain Markdown at <dir>/<name>/SKILL.md in either location.
+skills_dirs_json() {
+  local project="${1:-}" p_open p_claude g_open g_claude
+  p_open=""
+  p_claude=""
+  if [ -n "$project" ]; then
+    p_open="$project/.opencode/skills"
+    p_claude="$project/.claude/skills"
+  fi
+  g_open="$(expand_home "~/.config/opencode/skills")"
+  g_claude="$(expand_home "~/.claude/skills")"
+  jq -nc --arg project "$project" --arg po "$p_open" --arg pc "$p_claude" \
+    --arg go "$g_open" --arg gc "$g_claude" \
+    '{project: (if $project == "" then null else $project end),
+      project_skills: (if $project == "" then []
+        else [{tool: "opencode", dir: $po}, {tool: "claude", dir: $pc}] end),
+      global_skills: [{tool: "opencode", dir: $go}, {tool: "claude", dir: $gc}]}'
+}
+
+# cmd_skills dir [--project <name|path>] [--json] -- print where skills live:
+# the project-scoped directories of both tools (when a project can be resolved)
+# and the machine-global ones. Without --json a short labelled list; the
+# explorer uses it instead of guessing tool-specific paths.
+cmd_skills() {
+  local action="" project_name="" want_json=0 arg
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --project) project_name="${1:-}"; shift ;;
+      --json) want_json=1 ;;
+      -h|--help) usage ;;
+      --*) usage_error "unknown option: $arg" ;;
+      *)
+        if [ -z "$action" ]; then action="$arg"
+        else usage_error "unexpected argument: $arg"; fi ;;
+    esac
+  done
+  [ -n "$action" ] || usage_error "usage: boss skills dir [--project <name|path>] [--json]"
+  case "$action" in
+    dir) ;;
+    *) usage_error "unknown skills action: $action" ;;
+  esac
+  ensure_config
+
+  local project=""
+  if [ -n "$project_name" ]; then
+    project="$(resolve_project "$project_name")" || exit 1
+  else
+    project="$(find_openspec_root "$PWD" || true)"
+  fi
+
+  local json
+  json="$(skills_dirs_json "$project")"
+  if [ "$want_json" -eq 1 ]; then
+    printf '%s\n' "$json"
+    return 0
+  fi
+  printf 'project skills (write here for this project):\n'
+  if [ -n "$project" ]; then
+    printf '%s' "$json" | jq -r '.project_skills[] | "  \(.dir)  [\(.tool)]"'
+  else
+    printf '  (no project resolved; pass --project <name|path>)\n'
+  fi
+  printf 'global skills (write here for the machine):\n'
+  printf '%s' "$json" | jq -r '.global_skills[] | "  \(.dir)  [\(.tool)]"'
+}
+
 # ----------------------------------------------------------------- mission ---
 
 # missions_dir <project> -- directory of the mission docs: '[missions] dir'
@@ -1818,6 +1891,7 @@ main() {
     retrigger) shift; cmd_retrigger "$@" ;;
     finish) shift; cmd_finish "$@" ;;
     answer) shift; cmd_answer "$@" ;;
+    skills) shift; cmd_skills "$@" ;;
     claim) shift; cmd_claim "$@" ;;
     session) shift; cmd_session "$@" ;;
     mission) shift; cmd_mission "$@" ;;

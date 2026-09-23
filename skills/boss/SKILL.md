@@ -105,14 +105,16 @@ Command (`boss`) and agent name (`apply-<change>`) stay as they are.
    completion.
 6. **Finish** – if the review passes: `boss finish <change>` closes the
    apply tab and cleans up; it needs the agent to be settled, nothing else.
-   Capture the one lesson worth keeping with `--lesson "<text>"` and, if it is
-   not a property of this project, `--lesson-scope global`. Choose the store:
-   a project property (how its tests run, where the real data lives) goes to
-   the project store (default), a machine/environment property (a firewall,
-   a cold runner) goes global; a pure tool/process rule belongs in the
-   runner's `apply` template instead, not in a store. Record only what the
-   review verified, not the apply agent's claims. Keep the active list short –
-   move stale entries from `## Active` to `## Log` yourself; boss never trims.
+   Capture what the review verified, not what the apply agent claimed. A short
+   fact that stays relevant goes to a store with `--lesson "<text>"` (and
+   `--lesson-scope global` when it is not a property of this project); a
+   reusable procedure or trap becomes a **skill** – see
+   [Skills from experience](#skills-from-experience). Choose the store: a
+   project property (how its tests run, where the real data lives) goes to the
+   project store (default), a machine/environment property (a firewall, a cold
+   runner) goes global; a pure tool/process rule belongs in the runner's
+   `apply` template, in neither. Keep the active list short – move stale
+   entries from `## Active` to `## Log` yourself; boss never trims.
    After `finish` the apply agent is gone: further work on the same change
    means a new `boss dispatch <change>` (not `retrigger`, which needs the old
    agent). A new dispatch starts a fresh run – the retrigger counter and the
@@ -131,6 +133,38 @@ Command (`boss`) and agent name (`apply-<change>`) stay as they are.
    `y`) or to end the apply (`boss finish <change> --force`). If you do not
    want to answer the question yourself, escalate to the human (see
    Escalation). You make the decision, not the apply agent.
+
+## Skills from experience
+
+A **skill** is a verified, reusable procedure that the next executer loads
+through its own tool – not a paragraph in the apply prompt. Distinguish:
+
+- a **short fact** that stays relevant (the path of the real data) goes to a
+  store via `boss finish --lesson "<text>"`;
+- a **procedure or trap** that recurs (a multi-step check with a pitfall) is
+  written as a skill;
+- a **pure runner/process rule** (commit before finishing) goes into the
+  runner's `apply` template, in neither.
+
+Only the **Explorer** writes or updates a skill, and only after the review
+verified the lesson; the **Executer never writes skills**. If approval is
+agreed for the project, the Explorer presents a new or changed skill to the
+human before it becomes active – without approval it stays a proposal.
+
+A skill follows the agentskills format: YAML frontmatter with `name` and
+`description`, then a body with *When to Use*, *Procedure*, *Pitfalls* and
+*Verification*. A pitfall is a general rule plus one sentence of reason – no
+narration, no ticket numbers, no dates. Write the skill into both tools'
+directories so it is found whatever the runner:
+
+- **project skills** go in `<project>/.opencode/skills/<name>/SKILL.md` and
+  `<project>/.claude/skills/<name>/SKILL.md`; they travel with the project repo;
+- **machine/environment skills** (a firewall, a cold runner) go in the global
+  skill directories of both tools.
+
+`boss skills dir [--project <name|path>] [--json]` prints all of these paths.
+The Executer loads skills from its tool as needed; boss never injects a skill
+body into the apply prompt.
 
 ## Missions
 

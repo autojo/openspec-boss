@@ -343,6 +343,34 @@ the boss verifies them during the review and records only what survived, with
 `boss review` shows the active lessons of both stores under `lessons.global` and
 `lessons.project`; `boss status <change>` names them too.
 
+## Skills from experience
+
+Some lessons are not a single fact but a procedure: a multi-step check with a
+trap that recurs. Those do not belong in the lesson stores (they would bloat
+every prompt) and not in a `--note` (they outlive one change). The Explorer
+writes them as **skills** instead, once the review has verified them:
+
+- **skill vs. fact**: a short, always-relevant fact stays in a store
+  (`boss finish --lesson`); a reusable procedure or pitfall becomes a skill; a
+  pure runner/process rule (how the apply commits) goes into the runner's
+  `apply` template, in neither.
+- **location**: project skills live in the project repo, in both tools'
+  directories (`<project>/.opencode/skills/<name>/SKILL.md` and
+  `<project>/.claude/skills/<name>/SKILL.md`); properties of the machine or
+  environment (a firewall, a cold runner) live in the global directories
+  (`~/.config/opencode/skills/`, `~/.claude/skills/`). `boss skills dir
+  [--project <name|path>] [--json]` prints the paths for a project.
+- **format**: YAML frontmatter with `name` and `description`, then *When to
+  Use*, *Procedure*, *Pitfalls* and *Verification*. A pitfall is a general rule
+  plus one sentence of reason – no narration, ticket numbers or dates.
+- **author**: only the Explorer writes a skill, after the review verified the
+  lesson; the Executer never writes one. If approval is agreed for the project,
+  the Explorer presents a new or changed skill first; without approval it stays
+  a proposal.
+
+The Executer loads skills through its own tool as needed – boss never injects a
+skill body into the apply prompt. Without skills everything works as before.
+
 ## Limiting permissions to the workspace
 
 By default OpenCode already allows everything, and a global

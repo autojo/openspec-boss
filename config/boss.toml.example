@@ -61,6 +61,14 @@ shop = "uv run pytest -q"
 global = "~/.config/openspec-boss/lessons.md"
 project = "openspec/lessons.md"
 
+# Optional: skills from experience. Verified procedures (a multi-step check with
+# a trap) become skills the next apply loads through its tool, not paragraphs in
+# the prompt. Project skills live in <project>/.opencode/skills/<name>/SKILL.md
+# and <project>/.claude/skills/<name>/SKILL.md, machine/environment skills in
+# ~/.config/opencode/skills/ and ~/.claude/skills/; 'boss skills dir
+# --project <name>' prints them. Short facts stay in [lessons] above, and a
+# pure runner/process rule belongs in the runner's apply template.
+
 # Optional: the directory of the mission docs, relative to the project root
 # (default openspec/missions); an absolute or ~ path is used as is and a
 # leading ~ is expanded. A configuration without this table keeps the default.
