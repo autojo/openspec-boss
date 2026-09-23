@@ -18,7 +18,7 @@ Usage:
   boss review <change> [--project <name|path>] [--json]
   boss wait <change> [--project <name|path>]
   boss retrigger <change> [--project <name|path>] [--note <text>]
-  boss finish <change> [--project <name|path>] [--force]
+  boss finish <change> [--project <name|path>] [--force] [--lesson <text>] [--lesson-scope project|global]
   boss answer <change> <key>... [--project <name|path>]
   boss claim [--name <name>] [--release]
   boss session [--project <name|path>] [--runner <name>]
@@ -149,6 +149,80 @@ resolve_runner() {
 runner_yield_of() {
   printf '%s' "$1" | jq -r --arg d "$BOSS_APPLY_YIELD_DEFAULT" \
     'if has("yield") then .yield else $d end'
+}
+
+# ---------------------------------------------------------------- lessons ---
+
+# lessons_global_path -- absolute path of the global lessons store: the
+# BOSS_LESSONS_GLOBAL override, else '[lessons] global', else the default. A
+# leading ~ is expanded.
+lessons_global_path() {
+  local cfg path
+  if [ -n "${BOSS_LESSONS_GLOBAL:-}" ]; then
+    expand_home "$BOSS_LESSONS_GLOBAL"
+    return 0
+  fi
+  cfg="$(config_json)" || return 1
+  path="$(printf '%s' "$cfg" | jq -r '.lessons.global // empty')"
+  [ -n "$path" ] || path="~/.config/openspec-boss/lessons.md"
+  expand_home "$path"
+}
+
+# lessons_project_path <project> -- path of the project's lessons store:
+# '[lessons] project' relative to the project root, or the default
+# openspec/lessons.md. An absolute or ~ path is used as is.
+lessons_project_path() {
+  local project="$1" cfg path
+  cfg="$(config_json)" || return 1
+  path="$(printf '%s' "$cfg" | jq -r '.lessons.project // empty')"
+  [ -n "$path" ] || path="openspec/lessons.md"
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    "~"|"~/"*) expand_home "$path" ;;
+    *) printf '%s/%s\n' "$project" "$path" ;;
+  esac
+}
+
+# lessons_prompt_block <global-file> <project-file> -- the "known lessons"
+# block for the apply prompt: global lessons first, then project lessons,
+# capped at BOSS_LESSONS_MAX rules and BOSS_LESSONS_MAX_CHARS characters.
+# Prints nothing when neither store yields an active lesson; an unreadable
+# store is logged and skipped.
+lessons_prompt_block() {
+  local gfile="$1" pfile="$2"
+  local max="${BOSS_LESSONS_MAX:-20}" maxchars="${BOSS_LESSONS_MAX_CHARS:-2000}"
+  local -a lines=()
+  local out rc l header len n
+  out="$(lessons_read_active "$gfile")"; rc=$?
+  [ "$rc" -eq 0 ] || log "warning: cannot read lessons file $gfile"
+  while IFS= read -r l; do [ -n "$l" ] && lines+=("$l"); done <<<"$out"
+  out="$(lessons_read_active "$pfile")"; rc=$?
+  [ "$rc" -eq 0 ] || log "warning: cannot read lessons file $pfile"
+  while IFS= read -r l; do [ -n "$l" ] && lines+=("$l"); done <<<"$out"
+  [ "${#lines[@]}" -gt 0 ] || return 0
+
+  header="Verified lessons from earlier runs:"
+  len="${#header}"
+  n=0
+  out="$header"
+  for l in "${lines[@]}"; do
+    [ "$n" -lt "$max" ] || break
+    [ $(( len + ${#l} + 1 )) -le "$maxchars" ] || break
+    out="$out"$'\n'"$l"
+    len=$(( len + ${#l} + 1 ))
+    n=$(( n + 1 ))
+  done
+  [ "$n" -gt 0 ] || return 0
+  printf '%s' "$out"
+}
+
+# lessons_active_json <file> -- the active lessons of a store as a JSON array
+# (empty when the store is missing or unreadable, which is logged).
+lessons_active_json() {
+  local file="$1" out rc
+  out="$(lessons_read_active "$file")"; rc=$?
+  [ "$rc" -eq 0 ] || log "warning: cannot read lessons file $file"
+  printf '%s' "$out" | jq -Rsc 'split("\n") | map(select(length > 0))'
 }
 
 # find_openspec_root <dir> -- nearest ancestor containing openspec/, or empty
@@ -671,7 +745,13 @@ cmd_dispatch() {
   apply_cmd="${apply_template/\{change\}/$change}"
   local runner_yield
   runner_yield="$(runner_yield_of "$runner")"
-  send_prompt "$agent_name" "$(compose_apply_prompt "$apply_cmd" "$note" "$runner_yield")"
+  local gfile pfile lessons_block=""
+  gfile="$(lessons_global_path 2>/dev/null || true)"
+  pfile="$(lessons_project_path "$project" 2>/dev/null || true)"
+  if [ -n "$gfile" ] && [ -n "$pfile" ]; then
+    lessons_block="$(lessons_prompt_block "$gfile" "$pfile")" || lessons_block=""
+  fi
+  send_prompt "$agent_name" "$(compose_apply_prompt "$apply_cmd" "$note" "$lessons_block" "$runner_yield")"
 
   herdr_raw "pane.report_metadata" "$(jq -nc --arg p "$pane_id" --arg c "$change" \
     '{pane_id: $p, source: "openspec", tokens: {os_change: $c, os_phase: "apply"}}')" >/dev/null || exit 1
@@ -685,11 +765,11 @@ cmd_dispatch() {
   mkdir -p "$BOSS_APPLIES_DIR" || die_json "state_write" "cannot create state dir $BOSS_APPLIES_DIR"
   jq -n \
     --arg change "$change" --arg project "$project" --arg runner "$runner_name_out" \
-    --arg kind "$kind" --arg apply_cmd "$apply_cmd" --arg note "$note" --arg yield "$runner_yield" --arg agent "$agent_name" \
+    --arg kind "$kind" --arg apply_cmd "$apply_cmd" --arg note "$note" --arg lessons "$lessons_block" --arg yield "$runner_yield" --arg agent "$agent_name" \
     --arg pane_id "$pane_id" --arg tab_id "$tab_id" --arg workspace_id "$workspace_id" --arg boss "$dispatcher_boss" \
     --arg base_head "$base_head" \
     --arg started_at "$now" --arg last_state "working" --arg last_state_at "$now" \
-    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, boss: $boss, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at}' \
+    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, boss: $boss, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at}' \
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"
 
   setsid -f "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1
@@ -808,6 +888,14 @@ status_one() {
     dialog="$(herdr agent read "$pane_id" --source visible 2>/dev/null || true)"
   fi
 
+  local lessons_global_json lessons_project_json gfile pfile
+  lessons_global_json="[]"
+  lessons_project_json="[]"
+  gfile="$(lessons_global_path 2>/dev/null || true)"
+  pfile="$(lessons_project_path "$project" 2>/dev/null || true)"
+  [ -n "$gfile" ] && lessons_global_json="$(lessons_active_json "$gfile")"
+  [ -n "$pfile" ] && lessons_project_json="$(lessons_active_json "$pfile")"
+
   local json
   json="$(jq -n \
     --arg change "$change" --arg project "$project" --arg agent "$agent" \
@@ -821,7 +909,8 @@ status_one() {
     --argjson commits "$(printf '%s' "$commits" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --argjson diff_stat_range "$(printf '%s' "$diff_stat_range" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --arg summary "$summary" \
-    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, pane: $pane, herdr_agent: $herdr_agent, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end)}')"
+    --argjson lessons_global "$lessons_global_json" --argjson lessons_project "$lessons_project_json" \
+    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, pane: $pane, herdr_agent: $herdr_agent, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end)}')"
 
   if [ "$json_only" -eq 1 ]; then
     printf '%s\n' "$json"
@@ -850,6 +939,12 @@ status_one() {
   fi
   if [ -n "$diff_stat" ]; then
     printf 'git diff --stat:\n%s\n' "$diff_stat"
+  fi
+  if [ "$(printf '%s' "$lessons_global_json" | jq 'length')" -gt 0 ]; then
+    printf 'lessons (global):\n%s\n' "$(printf '%s' "$lessons_global_json" | jq -r 'join("\n")')"
+  fi
+  if [ "$(printf '%s' "$lessons_project_json" | jq 'length')" -gt 0 ]; then
+    printf 'lessons (project):\n%s\n' "$(printf '%s' "$lessons_project_json" | jq -r 'join("\n")')"
   fi
   if [ "$agent_state" = "blocked" ] && [ -n "$dialog" ]; then
     printf 'blocked dialog:\n%s\n' "$dialog"
@@ -1123,6 +1218,14 @@ cmd_review() {
     fi
   fi
 
+  local lessons_global_json lessons_project_json gfile pfile
+  lessons_global_json="[]"
+  lessons_project_json="[]"
+  gfile="$(lessons_global_path 2>/dev/null || true)"
+  pfile="$(lessons_project_path "$project" 2>/dev/null || true)"
+  [ -n "$gfile" ] && lessons_global_json="$(lessons_active_json "$gfile")"
+  [ -n "$pfile" ] && lessons_project_json="$(lessons_active_json "$pfile")"
+
   local json
   json="$(jq -n \
     --arg change "$change" --arg project "$project" \
@@ -1134,9 +1237,11 @@ cmd_review() {
     --argjson commits "$(printf '%s' "$commits" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --argjson diff_stat_range "$(printf '%s' "$diff_stat_range" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --arg summary "$summary" \
+    --argjson lessons_global "$lessons_global_json" --argjson lessons_project "$lessons_project_json" \
     --argjson retriggers "$retriggers" --argjson blocked_count "$blocked_count" \
     --argjson waiter_lost "$waiter_lost" --argjson duration_s "$duration_s" --arg note "$note" \
     '{change: $change, project: $project, summary: (if $summary == "" then null else $summary end),
+      lessons: {global: $lessons_global, project: $lessons_project},
       quality: {tasks: $tasks, validate: $validate,
         tests: {result: $test_result, command: (if $test_cmd == "" then null else $test_cmd end)},
         git: {base_head: (if $base_head == "" then null else $base_head end),
@@ -1165,6 +1270,12 @@ cmd_review() {
     printf 'tests: %s (no standard command recognized)\n' "$test_result"
   fi
   printf 'friction: %s retrigger(s), %s blocked, waiter_lost=%s\n' "$retriggers" "$blocked_count" "$waiter_lost"
+  if [ "$(printf '%s' "$lessons_global_json" | jq 'length')" -gt 0 ]; then
+    printf 'lessons (global):\n%s\n' "$(printf '%s' "$lessons_global_json" | jq -r 'join("\n")')"
+  fi
+  if [ "$(printf '%s' "$lessons_project_json" | jq 'length')" -gt 0 ]; then
+    printf 'lessons (project):\n%s\n' "$(printf '%s' "$lessons_project_json" | jq -r 'join("\n")')"
+  fi
   if [ -n "$summary" ]; then
     printf 'summary (last agent output):\n%s\n' "$summary"
   fi
@@ -1246,7 +1357,7 @@ cmd_retrigger() {
   done
   [ -n "$change" ] || usage_error "usage: boss retrigger <change> [--project <name|path>] [--note <text>]"
 
-  local state_file agent pane_id apply_cmd res project runner_yield
+  local state_file agent pane_id apply_cmd res project runner_yield lessons_block
   state_file="$(find_state_file "$change" "$project_name")" || exit 1
   agent="$(jq -r '.agent' "$state_file")"
   pane_id="$(jq -r '.pane_id' "$state_file")"
@@ -1257,6 +1368,19 @@ cmd_retrigger() {
   else
     # State files from before the yield field: derive it from the runner config.
     runner_yield="$(runner_yield_of "$(resolve_runner "$(jq -r '.runner // empty' "$state_file")")")"
+  fi
+  if jq -e 'has("lessons")' "$state_file" >/dev/null 2>&1; then
+    # The dispatch froze the block in the state; resend exactly that.
+    lessons_block="$(jq -r '.lessons // ""' "$state_file")"
+  else
+    # State files from before the lessons field: read the stores again.
+    local rgfile rpfile
+    rgfile="$(lessons_global_path 2>/dev/null || true)"
+    rpfile="$(lessons_project_path "$project" 2>/dev/null || true)"
+    lessons_block=""
+    if [ -n "$rgfile" ] && [ -n "$rpfile" ]; then
+      lessons_block="$(lessons_prompt_block "$rgfile" "$rpfile")" || lessons_block=""
+    fi
   fi
   if [ "$note_given" -eq 1 ]; then
     write_state_field "$state_file" note "$note"
@@ -1277,7 +1401,7 @@ cmd_retrigger() {
 
   # The waiter stays armed across turns; make sure one is alive before prompting.
   res="$(ensure_waiter "$state_file")"
-  send_prompt "$pane_id" "$(compose_apply_prompt "$apply_cmd" "$note" "$runner_yield")"
+  send_prompt "$pane_id" "$(compose_apply_prompt "$apply_cmd" "$note" "$lessons_block" "$runner_yield")"
   log "retrigger: change=$change agent=$agent waiter=$res"
 
   append_event "$(events_file_for "$project" "$change")" retrigger \
@@ -1307,18 +1431,24 @@ tasks_file_for() {
 cmd_finish() {
   ensure_boss_claim finish
   ensure_config
-  local change="" project_name="" force=0 arg
+  local change="" project_name="" force=0 lesson_text="" lesson_scope="project" arg
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
       --project) project_name="${1:-}"; shift ;;
       --force) force=1 ;;
+      --lesson) lesson_text="$(one_line "${1:-}")"; shift ;;
+      --lesson-scope) lesson_scope="${1:-}"; shift ;;
       -h|--help) usage ;;
       --*) usage_error "unknown option: $arg" ;;
       *) if [ -z "$change" ]; then change="$arg"; else usage_error "unexpected argument: $arg"; fi ;;
     esac
   done
-  [ -n "$change" ] || usage_error "usage: boss finish <change> [--project <name|path>] [--force]"
+  [ -n "$change" ] || usage_error "usage: boss finish <change> [--project <name|path>] [--force] [--lesson <text>] [--lesson-scope project|global]"
+  case "$lesson_scope" in
+    project|global) ;;
+    *) usage_error "--lesson-scope must be project or global" ;;
+  esac
 
   local state_file project tab_id pane_id waiter_pid archived=false agent_state
   state_file="$(find_state_file "$change" "$project_name")" || exit 1
@@ -1380,12 +1510,34 @@ cmd_finish() {
     || log "warning: could not record cycle event"
 
   rm -f "$state_file"
+
+  # The verified lesson of the run is written only here, never by the apply
+  # agent. A write error is reported but must not block the finish.
+  local lesson_json="null" lesson_file
+  if [ -n "$lesson_text" ]; then
+    if [ "$lesson_scope" = "global" ]; then
+      lesson_file="$(lessons_global_path 2>/dev/null || true)"
+    else
+      lesson_file="$(lessons_project_path "$project" 2>/dev/null || true)"
+    fi
+    if [ -z "$lesson_file" ]; then
+      lesson_json="$(jq -nc --arg s "$lesson_scope" '{scope: $s, path: null, error: "cannot resolve lessons path"}')"
+      log "warning: could not record lesson: cannot resolve $lesson_scope lessons path"
+    elif lesson_append "$lesson_file" "$lesson_text"; then
+      lesson_json="$(jq -nc --arg s "$lesson_scope" --arg p "$lesson_file" '{scope: $s, path: $p}')"
+      log "finish: recorded $lesson_scope lesson in $lesson_file"
+    else
+      lesson_json="$(jq -nc --arg s "$lesson_scope" --arg p "$lesson_file" '{scope: $s, path: $p, error: "cannot write lessons file"}')"
+      log "warning: could not record $lesson_scope lesson in $lesson_file"
+    fi
+  fi
+
   log "finish: change=$change project=$project"
 
   printf '%s\n' "$(jq -n \
     --arg change "$change" --arg project "$project" --arg tab_id "$tab_id" --arg status "finished" \
-    --argjson archived "$archived" \
-    '{change: $change, project: $project, tab_id: $tab_id, archived: $archived, status: $status}')"
+    --argjson archived "$archived" --argjson lesson "$lesson_json" \
+    '{change: $change, project: $project, tab_id: $tab_id, archived: $archived, lesson: $lesson, status: $status}')"
 }
 
 # ------------------------------------------------------------------ answer ---

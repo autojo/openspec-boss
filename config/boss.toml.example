@@ -51,3 +51,12 @@ api = "~/work/api"
 # finds none, the review reports not_run instead of a false fail.
 [tests]
 shop = "uv run pytest -q"
+
+# Optional: the two stores for verified lessons. The global store belongs to
+# this machine and is never written into a project repo; the project store
+# lives in the project (relative to its root). Both are plain Markdown with an
+# '## Active' (injected into the next apply prompt) and an '## Log' section.
+# A leading ~ is expanded; BOSS_LESSONS_GLOBAL overrides lessons.global.
+[lessons]
+global = "~/.config/openspec-boss/lessons.md"
+project = "openspec/lessons.md"

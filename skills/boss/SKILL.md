@@ -87,6 +87,14 @@ finishes.
    completion.
 6. **Finish** – if the review passes: `boss finish <change>` closes the
    apply tab and cleans up; it needs the agent to be settled, nothing else.
+   Capture the one lesson worth keeping with `--lesson "<text>"` and, if it is
+   not a property of this project, `--lesson-scope global`. Choose the store:
+   a project property (how its tests run, where the real data lives) goes to
+   the project store (default), a machine/environment property (a firewall,
+   a cold runner) goes global; a pure tool/process rule belongs in the
+   runner's `apply` template instead, not in a store. Record only what the
+   review verified, not the apply agent's claims. Keep the active list short –
+   move stale entries from `## Active` to `## Log` yourself; boss never trims.
    After `finish` the apply agent is gone: further work on the same change
    means a new `boss dispatch <change>` (not `retrigger`, which needs the old
    agent). A new dispatch starts a fresh run – the retrigger counter and the

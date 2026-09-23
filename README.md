@@ -77,7 +77,7 @@ boss status [<change>] [--project <name|path>] [--json]
 boss review <change> [--project <name|path>] [--json]
 boss wait <change> [--project <name|path>]
 boss retrigger <change> [--project <name|path>] [--note <text>]
-boss finish <change> [--project <name|path>] [--force]
+boss finish <change> [--project <name|path>] [--force] [--lesson <text>] [--lesson-scope project|global]
 boss answer <change> <key>... [--project <name|path>]
 boss claim [--name <name>] [--release]
 boss session [--project <name|path>] [--runner <name>]
@@ -119,7 +119,10 @@ boss config-json
 - `finish` closes the apply tab, stops the waiter and drops the state. It
   reports whether the change is archived (`archived`) but does not require it –
   archiving stays a separate step. It refuses only while the apply agent is
-  still `working` (override with `--force`).
+  still `working` (override with `--force`). Pass `--lesson "<text>"` (and
+  optionally `--lesson-scope project|global`, default `project`) to record the
+  verified lesson of the run; the result names it under `lesson` (`null` when
+  none was given), see [Lessons from earlier applies](#lessons-from-earlier-applies).
 - `answer` sends keys (e.g. `enter`, `esc`, `y`) to a blocked apply agent, so
   the boss can answer follow-up questions itself.
 - `claim` makes the current pane the boss of its Herdr workspace and returns
@@ -163,6 +166,10 @@ apply = "/opsx:apply {change}"
 [projects]
 shop = "~/work/shop"
 
+[lessons]
+global = "~/.config/openspec-boss/lessons.md"
+project = "openspec/lessons.md"
+
 [tests]
 shop = "uv run pytest -q"
 ```
@@ -173,6 +180,14 @@ registry name. Without an entry, boss detects a standard command from the
 project (`Justfile`, `package.json` with its lockfile, pytest with `uv.lock`/
 `poetry.lock`, `Makefile`); if it finds none – or the program is not installed
 – the review reports `not_run`, not a red test.
+
+The optional `[lessons]` table points boss at the two lesson stores: `global`
+(default `~/.config/openspec-boss/lessons.md`, overridden by the environment
+variable `BOSS_LESSONS_GLOBAL`) and `project` (default `openspec/lessons.md`,
+relative to the project root, override with an absolute or `~` path if you want
+it elsewhere). A leading `~` is expanded to `$HOME`. A configuration without
+the table keeps working with exactly these defaults; see
+[Lessons from earlier applies](#lessons-from-earlier-applies).
 
 The `apply` template may carry more than the OpenSpec command: any free text is
 sent to the agent along with it, before the note and the yield instruction. That
@@ -218,6 +233,43 @@ in the waiter. If the apply stays `working` for that long without settling, the
 waiter sends the boss an informational "still working" notice and keeps waiting;
 it never treats the timeout as a lost agent. Set it above your longest normal
 apply to avoid noise.
+
+## Lessons from earlier applies
+
+An apply run ends its turn and is gone; what it learned should not be paid for
+again by the next run. boss keeps **verified** lessons in two plain-Markdown
+stores and feeds them back into the next apply prompt:
+
+- **project store** (`openspec/lessons.md` in the target project, override with
+  `[lessons] project`): properties of *this* project – how its tests run, where
+  the real data lives, what a change must not break. It travels with the
+  project repo.
+- **global store** (`~/.config/openspec-boss/lessons.md`, override with
+  `[lessons] global` or `BOSS_LESSONS_GLOBAL`): properties of the *machine and
+  environment* that hold across every project and boss session – a firewall that
+  throttles too many SSH calls, a runner that starts cold. It stays local and is
+  never written into a project repo.
+- **tool/process rules** (how the apply should commit, which tool to use for a
+  check) belong in neither store – put them in the runner's `apply` template in
+  `boss.toml`, once.
+
+Each store is Markdown with an `## Active` section (the short, curated list that
+is injected) and an `## Log` section (dated history). Only `## Active` lines
+starting with `- ` reach a prompt; boss appends and never shortens or reorders,
+so trimming the active list is a deliberate human decision.
+
+`boss dispatch` reads both stores, global before project, and adds a capped
+block ("verified lessons from earlier runs") to the apply prompt, before the
+yield instruction; `boss retrigger` reuses the block frozen at dispatch. Missing
+stores change nothing; an unreadable store is logged and the dispatch continues.
+The block carries at most `BOSS_LESSONS_MAX` rules (default 20) and
+`BOSS_LESSONS_MAX_CHARS` characters (default 2000).
+
+The apply agent never writes a store: it reports observations in its `summary`,
+the boss verifies them during the review and records only what survived, with
+`boss finish <change> --lesson "<text>" [--lesson-scope project|global]`.
+`boss review` shows the active lessons of both stores under `lessons.global` and
+`lessons.project`; `boss status <change>` names them too.
 
 ## Limiting permissions to the workspace
 

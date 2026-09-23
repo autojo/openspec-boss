@@ -22,6 +22,10 @@ BOSS_AGENT_PROMPT_TIMEOUT_MS="${BOSS_AGENT_PROMPT_TIMEOUT_MS:-90000}"
 BOSS_RUNNER_READY_TIMEOUT_MS="${BOSS_RUNNER_READY_TIMEOUT_MS:-90000}"
 BOSS_REVIEW_TEST_TIMEOUT_S="${BOSS_REVIEW_TEST_TIMEOUT_S:-300}"
 BOSS_WAITER_STALL_MS="${BOSS_WAITER_STALL_MS:-2700000}"
+# Caps for the lessons block injected into an apply prompt: at most this many
+# active lesson lines and this many characters, taken global-first.
+BOSS_LESSONS_MAX="${BOSS_LESSONS_MAX:-20}"
+BOSS_LESSONS_MAX_CHARS="${BOSS_LESSONS_MAX_CHARS:-2000}"
 
 # Appended to every apply prompt unless the runner overrides or disables it:
 # the apply must end its turn, the boss is woken by the waiter and retriggers.
@@ -305,13 +309,73 @@ one_line() {
   printf '%s' "$1" | tr '\n\r\t' '   ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'
 }
 
-# compose_apply_prompt <apply-cmd> <note> <yield> -- the text sent to the
-# apply agent: command, then the note (if any), then the yield instruction
-# (if any). The yield ends the prompt on purpose.
+# lessons_read_active <file> -- the active lesson lines (each starting with
+# '- ') under the '## Active' heading, one per line and in file order. A
+# missing file or a missing '## Active' section yields nothing; a file that
+# exists but cannot be read returns 1 so the caller can warn.
+lessons_read_active() {
+  local file="$1"
+  [ -e "$file" ] || return 0
+  [ -r "$file" ] || return 1
+  awk '
+    /^## Active[[:space:]]*$/ { active = 1; next }
+    /^## / { active = 0 }
+    active && /^- / { print }
+  ' "$file" || return 1
+  return 0
+}
+
+# lesson_append <file> <text> -- append <text> as an active lesson under
+# '## Active' and as a dated entry under '## Log', creating the file and the
+# sections as needed. The active list is never shortened or reordered. The
+# write goes through mktemp + mv in the target directory, so a reader never
+# sees a half-written file.
+lesson_append() {
+  local file="$1" text="$2" stamp tmp
+  [ -n "$file" ] || return 1
+  mkdir -p "$(dirname "$file")" || return 1
+  stamp="$(now_iso)"
+  tmp="$(mktemp "${file}.XXXXXX" 2>/dev/null)" || return 1
+  if [ ! -f "$file" ]; then
+    printf '## Active\n\n- %s\n\n## Log\n\n- %s %s\n' "$text" "$stamp" "$text" >"$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    awk -v text="$text" -v stamp="$stamp" '
+      BEGIN { active = 0; log_seen = 0; inserted = 0 }
+      /^## Active[[:space:]]*$/ { active = 1 }
+      /^## Log[[:space:]]*$/ {
+        if (!inserted) {
+          if (!active) printf "## Active\n\n"
+          printf "- %s\n\n", text
+          inserted = 1
+        }
+        log_seen = 1
+        print
+        next
+      }
+      { print }
+      END {
+        if (!inserted) {
+          if (!active) printf "\n## Active\n"
+          printf "\n- %s\n", text
+        }
+        if (!log_seen) printf "\n## Log\n"
+        printf "\n- %s %s\n", stamp, text
+      }
+    ' "$file" >"$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+  return 0
+}
+
+# compose_apply_prompt <apply-cmd> <note> <lessons> <yield> -- the text sent
+# to the apply agent: command, then the note (if any), then the lessons block
+# (if any), then the yield instruction (if any). The yield ends the prompt on
+# purpose, so the lessons sit before it.
 compose_apply_prompt() {
   local out="$1"
-  [ -n "$2" ] && out="$out $2"
-  [ -n "$3" ] && out="$out $3"
+  [ -n "${2:-}" ] && out="$out $2"
+  [ -n "${3:-}" ] && out="$out $3"
+  [ -n "${4:-}" ] && out="$out $4"
   printf '%s' "$out"
 }
 
