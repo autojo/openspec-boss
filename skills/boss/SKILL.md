@@ -5,10 +5,22 @@ description: Controls OpenSpec changes as a central boss session across any numb
 
 # Boss – one session controls all OpenSpec changes
 
-You are the boss session. The human only talks to you. Applies run in their
-own Herdr tabs with their own agents (named `apply-…`, see `boss status`); you never work in the
-apply tab and never wait actively – you are woken by prompt when an apply
-finishes.
+You are the boss session – the **Explorer**. The human only talks to you. The
+Explorer owns the large task: it plans, creates changes, dispatches **Executers**,
+reviews their result, maintains skills and escalates. Each Executer is an apply
+agent in its own Herdr tab (named `apply-…`, see `boss status`) and implements
+exactly one OpenSpec change; you never work in the apply tab and never wait
+actively – you are woken by prompt when an apply finishes.
+
+## Explorer and Executer
+
+Two roles, one command set: the **Explorer** is this boss session
+(`boss-<workspace>`); an **Executer** is an apply agent (`apply-<change>`). The
+Explorer plans, delegates one change at a time, reviews the outcome and keeps the
+skills sharp; the Executer only carries out its one change and reports back. One
+workspace has at most one Explorer and at most one active Executer – `boss
+dispatch` refuses a second apply in the same workspace with `executer_busy`.
+Command (`boss`) and agent name (`apply-<change>`) stay as they are.
 
 ## Workflow
 
@@ -108,8 +120,9 @@ finishes.
 7. **Blocked** – if the completion message is `blocked`: `boss status
    <change>` shows the visible dialog of the apply pane. Decide yourself
    whether to answer (`boss answer <change> <key>…`, e.g. `enter`, `esc`,
-   `y`) or to end the apply (`boss finish <change> --force`). You make the
-   decision, not the apply agent.
+   `y`) or to end the apply (`boss finish <change> --force`). If you do not
+   want to answer the question yourself, escalate to the human (see
+   Escalation). You make the decision, not the apply agent.
 
 ## One boss per Herdr workspace
 
@@ -149,11 +162,22 @@ applies only inside tabs boss starts. To use it, make the global
 `"permission"` restrictive (e.g. `ask`); boss never edits your global config.
 A custom `env` on the runner replaces the default, `env = []` disables it.
 
-## Abort criterion
+## Escalation
 
-If after **3 retriggers** of the same change no progress is visible (no
-additional tasks done, no plausible new diff), stop and ask the human.
-Briefly describe what the apply delivers and what is wrong.
+The Explorer works autonomously and turns to the human only in three cases:
+
+- an Executer stays `blocked` and the Explorer does not want to answer the
+  question itself;
+- after **3 retriggers** of the same change no progress is visible (no
+  additional tasks done, no plausible new diff);
+- a judgment question would change the assignment, so the Explorer must not
+  decide it alone.
+
+An escalation is a Herdr notification that names the change and the reason, for
+example `herdr notification show "Boss: <change>" --body "<reason>"`, and the
+assignment stops until the human answers. Briefly describe what the apply
+delivers and what is wrong. In every other case the Explorer decides itself
+instead of asking.
 
 ## Rules
 

@@ -554,6 +554,26 @@ find_running_apply() {
   printf '%s' "$hit"
 }
 
+# find_workspace_executer <workspace-id> -- compact JSON {change,name,pane_id,
+# tab_id,workspace_id} of a living apply agent in that workspace, or empty.
+# One workspace runs at most one executer: two changes would share the working
+# tree. The calling pane and registered boss panes are never an executer. The
+# change is derived from the agent name (apply-<change>), so an over-long name
+# is shown in its hashed short form.
+find_workspace_executer() {
+  local workspace_id="$1" agents excluded
+  agents="$(herdr_json agent list)" || exit 1
+  excluded="$(boss_registered_pane_ids)"
+  printf '%s' "$agents" | jq -c \
+    --arg w "$workspace_id" --arg self "${HERDR_PANE_ID:-}" --arg ex "$excluded" \
+    '[.agents[] | select(((.name // "") | startswith("apply-")))
+        | select((.workspace_id // "") == $w)
+        | .pane_id as $pid
+        | select(($pid // "") != $self)
+        | select(($ex | split("\n") | index($pid)) | not)
+        | {change: ((.name // "") | sub("^apply-"; "")), name, pane_id, tab_id, workspace_id}] | .[0] // empty'
+}
+
 # await_runner_ready <agent> <pane> <runner-json> -- wait until the runner's
 # TUI can take input before the first prompt: settle to idle, honour an
 # optional `ready` marker (pane wait-output on a cold start) and answer an
@@ -693,6 +713,15 @@ cmd_dispatch() {
   while IFS= read -r a; do agent_args+=("$a"); done < <(printf '%s' "$runner" | jq -r '.args[]? // empty')
 
   workspace_id="$(ensure_workspace "$project" "$(basename "$project")")"
+
+  local ws_executer
+  ws_executer="$(find_workspace_executer "$workspace_id")"
+  if [ -n "$ws_executer" ] && [ "$ws_executer" != "null" ]; then
+    local busy_agent busy_change
+    busy_agent="$(printf '%s' "$ws_executer" | jq -r '.name')"
+    busy_change="$(printf '%s' "$ws_executer" | jq -r '.change')"
+    die_json "executer_busy" "workspace $workspace_id already runs executer '$busy_agent' for change '$busy_change'; finish it before dispatching '$change'"
+  fi
 
   local -a env_args=()
   while IFS= read -r e; do [ -n "$e" ] && env_args+=(--env "$e"); done < <(runner_env_of "$runner")

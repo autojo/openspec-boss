@@ -69,6 +69,22 @@ workspace the apply runs in, (2) the boss that dispatched the apply (stored in
 the state), (3) the global `BOSS_AGENT_NAME` (default `boss`). Dead agents are
 skipped; when none is reachable, the waiter shows a Herdr notification instead.
 
+## Explorer and Executer
+
+The system has two named roles. The boss session is the **Explorer**: it owns
+the big task, plans, creates changes, dispatches work, reviews the result,
+maintains the skills and escalates to the human. An **Executer** is an apply
+agent (`apply-<change>`) and implements exactly one OpenSpec change in its own
+Herdr tab; the Explorer never works in that tab.
+
+One workspace runs at most one active Executer at a time: two changes would
+share the same working tree and index. `boss dispatch` checks the target
+workspace before it opens a tab and refuses a second apply with `executer_busy`,
+naming the running change – finish it first. Different projects in different
+workspaces (one workspace per project, path like `~/work/<projekt>`) run their
+own Explorer and Executer in parallel. The command `boss` and the agent name
+`apply-<change>` stay unchanged; the roles are vocabulary, not a new process.
+
 ## Commands
 
 ```bash
@@ -86,7 +102,9 @@ boss config-json
 
 - `dispatch` starts the apply in its own tab and returns a JSON object with
   agent, pane, tab and workspace. A second dispatch of the same change in the
-  same project does not start a second apply (`already_running`). `--note`
+  same project does not start a second apply (`already_running`); a second
+  change in the same workspace is refused with `executer_busy`
+  (see [Explorer and Executer](#explorer-and-executer)). `--note`
   appends free text to the apply command so the boss can hand the apply agent
   context (what to test against, which tool to use for a check, who reviews)
   without touching the runner template; the note is stored and reused by
