@@ -85,6 +85,42 @@ workspaces (one workspace per project, path like `~/work/<projekt>`) run their
 own Explorer and Executer in parallel. The command `boss` and the agent name
 `apply-<change>` stay unchanged; the roles are vocabulary, not a new process.
 
+## Missions
+
+A large task that breaks into several changes is planned as a **mission**: a
+Markdown file in the target project with the goal in prose and the changes in
+execution order, one `- <change>` per line:
+
+```markdown
+# Mission: crawl-ausbau
+
+## Goal
+
+Ship the crawler: first the worker, then the rate limit, at last the cleanup.
+
+## Changes
+
+- add-worker
+- fix-ratelimit
+- archive-cleanup
+```
+
+`boss mission start <slug> --project <p>` writes this skeleton (never
+overwriting an existing file), `boss mission status <slug> --project <p>` shows
+the goal and each change with a derived state, and `boss mission next <slug>
+--project <p>` starts the first change that is not yet `done` through the normal
+dispatch path. The file stores no status of its own: a change is `done` when it
+is `finished` (a `finish` event), has no open task and is `openspec validate`
+green; `change_not_ready` means no proposal exists yet, the signal for the
+Explorer to create it before the next tick. `next` returns `mission_complete`
+when every change is done, and `executer_busy` when the workspace already runs
+an Executer. The mission doc lives under the project, so it is visible and
+versioned with the plan – default `openspec/missions/<slug>.md`, override with
+`[missions] dir` (a leading `~` is expanded).
+
+After each `boss finish` of a mission change the Explorer calls `boss mission
+next` for the next step; the order in the doc is the order of execution.
+
 ## Commands
 
 ```bash
@@ -97,6 +133,9 @@ boss finish <change> [--project <name|path>] [--force] [--lesson <text>] [--less
 boss answer <change> <key>... [--project <name|path>]
 boss claim [--name <name>] [--release]
 boss session [--project <name|path>] [--runner <name>]
+boss mission start <slug> --project <name|path>
+boss mission status <slug> [--project <name|path>]
+boss mission next <slug> [--project <name|path>]
 boss config-json
 ```
 
@@ -154,6 +193,12 @@ boss config-json
   `{project, workspace_id, agent, pane_id, tab_id, status}`; a workspace that
   already has a living boss is refused with `boss_exists` before any tab is
   created. Use it to stand up a boss for another project.
+- `mission` groups a large task into an ordered list of changes (see
+  [Missions](#missions)). `start` writes the mission doc if missing and never
+  overwrites an existing one; `status` shows the goal and each change with a
+  live-derived state; `next` dispatches the first change not yet `done` through
+  the normal `dispatch` path and reports `mission_complete`, `executer_busy` or
+  `change_not_ready`.
 
 All commands print JSON; errors appear as JSON on stderr with exit status 1
 (like Herdr). The tools provide thin slash commands:
@@ -188,6 +233,9 @@ shop = "~/work/shop"
 global = "~/.config/openspec-boss/lessons.md"
 project = "openspec/lessons.md"
 
+[missions]
+dir = "openspec/missions"
+
 [tests]
 shop = "uv run pytest -q"
 ```
@@ -206,6 +254,12 @@ relative to the project root, override with an absolute or `~` path if you want
 it elsewhere). A leading `~` is expanded to `$HOME`. A configuration without
 the table keeps working with exactly these defaults; see
 [Lessons from earlier applies](#lessons-from-earlier-applies).
+
+The optional `[missions]` table sets the directory of the mission docs
+(`dir`, default `openspec/missions`), relative to the project root; an absolute
+or `~` path is used as is and a leading `~` is expanded to `$HOME`. A
+configuration without the table keeps working with the default; see
+[Missions](#missions).
 
 The `apply` template may carry more than the OpenSpec command: any free text is
 sent to the agent along with it, before the note and the yield instruction. That

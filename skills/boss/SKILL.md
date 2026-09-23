@@ -31,8 +31,14 @@ Command (`boss`) and agent name (`apply-<change>`) stay as they are.
    `cd <project> && openspec …` (e.g. `openspec list`, `openspec status`).
    Project names come from the registry in `~/.config/openspec-boss/boss.toml`
    (the `[projects]` section).
+   For a large task that spans several changes, record the plan as a **mission**
+   in the target project – `boss mission start <slug> --project <p>`, then fill
+   in the goal and the change order (see [Missions](#missions)).
 2. **Dispatch** – once all artifacts of the change are ready:
    `boss dispatch <change> --project <name|path> [--runner <name>] [--note "<text>"]`.
+   In a mission, use `boss mission next <slug> --project <p>` instead of naming
+   each change: it picks the first change not yet `done` and dispatches it the
+   same way.
    Use `--note` to hand the apply agent context it cannot know (a real case
    to test against, which tool to use for a check, who reviews). Durable facts
    – URLs, measurements, external formats – belong in the change artifacts
@@ -110,7 +116,9 @@ Command (`boss`) and agent name (`apply-<change>`) stay as they are.
    After `finish` the apply agent is gone: further work on the same change
    means a new `boss dispatch <change>` (not `retrigger`, which needs the old
    agent). A new dispatch starts a fresh run – the retrigger counter and the
-   commit base (`base_head`) are reset. Archiving is a separate decision: run
+   commit base (`base_head`) are reset. If the change belongs to a mission,
+   call `boss mission next <slug> --project <p>` afterwards to start the next
+   step (see [Missions](#missions)). Archiving is a separate decision: run
    `/opsx:sync <change>` or
    `/opsx-sync <change>`, or `/opsx:archive <change>` or
    `/opsx-archive <change>` in the target project (Claude Code with `:`,
@@ -123,6 +131,36 @@ Command (`boss`) and agent name (`apply-<change>`) stay as they are.
    `y`) or to end the apply (`boss finish <change> --force`). If you do not
    want to answer the question yourself, escalate to the human (see
    Escalation). You make the decision, not the apply agent.
+
+## Missions
+
+A large task that breaks into several changes is planned as a **mission**: a
+Markdown file in the target project (default `openspec/missions/<slug>.md`,
+override with `[missions] dir`) that holds the goal in prose and the changes in
+execution order, one `- <change>` per line. The Explorer owns and writes it; the
+Executer never sees the mission, only its one change. The file stores no status
+– `boss mission status` derives it live from each change (proposal, task count,
+`openspec validate`, the `finish` event, the archive folder).
+
+- `boss mission start <slug> --project <p>` creates the doc skeleton and never
+  overwrites an existing one.
+- `boss mission status <slug> --project <p>` shows the goal plus every change
+  with its derived state (`done`, `in_progress`, `change_not_ready`) and the
+  progress.
+- `boss mission next <slug> --project <p>` starts the first change that is not
+  `done` through the normal dispatch path. It returns `mission_complete` when
+  all changes are done, `executer_busy` when the workspace already runs an
+  Executer, and `change_not_ready` when the chosen change has no proposal yet.
+
+The Explorer calls `boss mission next` after every `boss finish` of a mission
+change. `change_not_ready` is the normal signal to create the proposal now
+(plan first, lazy proposals) and call `next` again. The tick only follows the
+order in the doc and the derived states; the judgement stays with the Explorer:
+a `validate` that stays red, three retriggers without progress, or a
+`change_not_ready` it does not want to fill are reasons to reorder the mission,
+retrigger, or escalate (see Escalation). The role vocabulary is unchanged: the
+Explorer drives the mission, the Executer carries out exactly one change, the
+command `boss` and the agent name `apply-<change>` stay as they are.
 
 ## One boss per Herdr workspace
 

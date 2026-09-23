@@ -466,6 +466,66 @@ last_event_field() {
      | last // empty' "$file" 2>/dev/null || true
 }
 
+# mission_done_state <project> <change> -- derived mission state for one change
+# as compact JSON: {change, proposal, tasks:{missing,open,done,total}, validate,
+# finished, archived, state}. A mission stores no status; everything is read
+# live: the change dir (proposal), tasks.md, 'openspec validate --strict', the
+# finish event in the apply's event log and the archive folder. 'state' is
+# change_not_ready (no proposal), in_progress, or done = finished + no open
+# tasks + validate pass. An archived change counts as validated, because
+# validation can no longer be re-run once the change left the active folder.
+mission_done_state() {
+  local project="$1" change="$2"
+  local active_dir="$project/openspec/changes/$change"
+  local archive_dir proposal=false archived=false tf validate="not_run"
+  archive_dir="$(ls -d "$project"/openspec/changes/archive/*-"$change" 2>/dev/null | sed -n '1p')"
+  [ -n "$archive_dir" ] && archived=true
+  if [ -f "$active_dir/proposal.md" ] || { [ -n "$archive_dir" ] && [ -f "$archive_dir/proposal.md" ]; }; then
+    proposal=true
+  fi
+
+  tf=""
+  [ -f "$active_dir/tasks.md" ] && tf="$active_dir/tasks.md"
+  if [ -z "$tf" ] && [ -n "$archive_dir" ] && [ -f "$archive_dir/tasks.md" ]; then
+    tf="$archive_dir/tasks.md"
+  fi
+  local tasks_json tasks_open=null tasks_done=null tasks_total=null
+  if [ -n "$tf" ]; then
+    tasks_open="$(grep -c '^[[:space:]]*- \[ \]' "$tf" || true)"
+    tasks_done="$(grep -c '^[[:space:]]*- \[x\]' "$tf" || true)"
+    tasks_total=$((tasks_open + tasks_done))
+    tasks_json="$(jq -nc --argjson o "$tasks_open" --argjson d "$tasks_done" --argjson t "$tasks_total" \
+      '{missing: false, open: $o, done: $d, total: $t}')"
+  else
+    tasks_json='{"missing":true,"open":null,"done":null,"total":null}'
+  fi
+
+  if [ "$proposal" = true ] && command -v openspec >/dev/null 2>&1; then
+    if [ ! -d "$active_dir" ] && [ -n "$archive_dir" ]; then
+      validate="pass"
+    elif (cd "$project" && openspec validate "$change" --strict >/dev/null 2>&1); then
+      validate="pass"
+    else
+      validate="fail"
+    fi
+  fi
+
+  local finished=false
+  [ "$(event_count "$(events_file_for "$project" "$change")" finish)" -gt 0 ] && finished=true
+
+  local state="in_progress"
+  if [ "$proposal" != true ]; then
+    state="change_not_ready"
+  elif [ "$finished" = true ] && [ "$tasks_open" = 0 ] && [ "$validate" = "pass" ]; then
+    state="done"
+  fi
+
+  jq -nc --arg change "$change" --argjson proposal "$proposal" \
+    --argjson tasks "$tasks_json" --arg validate "$validate" \
+    --argjson finished "$finished" --argjson archived "$archived" --arg state "$state" \
+    '{change: $change, proposal: $proposal, tasks: $tasks, validate: $validate, finished: $finished, archived: $archived, state: $state}'
+}
+
 # expand_home <path> -- expand a leading ~
 expand_home() {
   case "$1" in

@@ -22,6 +22,9 @@ Usage:
   boss answer <change> <key>... [--project <name|path>]
   boss claim [--name <name>] [--release]
   boss session [--project <name|path>] [--runner <name>]
+  boss mission start <slug> --project <name|path>
+  boss mission status <slug> [--project <name|path>]
+  boss mission next <slug> [--project <name|path>]
   boss config-json
   boss --help
 EOF
@@ -574,6 +577,23 @@ find_workspace_executer() {
         | {change: ((.name // "") | sub("^apply-"; "")), name, pane_id, tab_id, workspace_id}] | .[0] // empty'
 }
 
+# assert_workspace_free <workspace-id> [<change>] -- die with executer_busy when
+# a living apply agent already runs in that workspace. <change> is the change
+# the caller wants to start; the running change is always named.
+assert_workspace_free() {
+  local workspace_id="$1" context="${2:-}" ws_executer busy_agent busy_change msg
+  ws_executer="$(find_workspace_executer "$workspace_id")"
+  [ -n "$ws_executer" ] && [ "$ws_executer" != "null" ] || return 0
+  busy_agent="$(printf '%s' "$ws_executer" | jq -r '.name')"
+  busy_change="$(printf '%s' "$ws_executer" | jq -r '.change')"
+  if [ -n "$context" ]; then
+    msg="workspace $workspace_id already runs executer '$busy_agent' for change '$busy_change'; finish it before dispatching '$context'"
+  else
+    msg="workspace $workspace_id already runs executer '$busy_agent' for change '$busy_change'; finish it before dispatching the next change"
+  fi
+  die_json "executer_busy" "$msg"
+}
+
 # await_runner_ready <agent> <pane> <runner-json> -- wait until the runner's
 # TUI can take input before the first prompt: settle to idle, honour an
 # optional `ready` marker (pane wait-output on a cold start) and answer an
@@ -658,10 +678,6 @@ send_prompt() {
 cmd_dispatch() {
   ensure_boss_claim dispatch
   ensure_config
-  # The dispatcher boss is recorded in the apply state so the waiter can wake
-  # it even when the apply runs in a different workspace.
-  local dispatcher_boss
-  dispatcher_boss="$(boss_agent_name "${HERDR_WORKSPACE_ID:-}")"
 
   local change="" project_name="" runner_name="" note="" arg
   while [ $# -gt 0 ]; do
@@ -677,10 +693,24 @@ cmd_dispatch() {
   done
   [ -n "$change" ] || usage_error "usage: boss dispatch <change> [--project <name|path>] [--runner <name>]"
 
-  local runner project agent_name
+  local runner project
   runner="$(resolve_runner "$runner_name")" || exit 1
   project="$(resolve_project "$project_name")" || exit 1
+  dispatch_change "$change" "$project" "$runner" "$note"
+}
+
+# dispatch_change <change> <project> <runner-json> <note> -- shared dispatch
+# path of 'boss dispatch' and 'boss mission next'. The caller has established
+# the boss claim and config and resolved project and runner.
+dispatch_change() {
+  local change="$1" project="$2" runner="$3" note="$4"
+  # The dispatcher boss is recorded in the apply state so the waiter can wake
+  # it even when the apply runs in a different workspace.
+  local dispatcher_boss
+  dispatcher_boss="$(boss_agent_name "${HERDR_WORKSPACE_ID:-}")"
+
   check_apply_ready "$project" "$change"
+  local agent_name
   agent_name="$(apply_agent_name "$change")"
 
   local project_registered=true hint=""
@@ -714,14 +744,7 @@ cmd_dispatch() {
 
   workspace_id="$(ensure_workspace "$project" "$(basename "$project")")"
 
-  local ws_executer
-  ws_executer="$(find_workspace_executer "$workspace_id")"
-  if [ -n "$ws_executer" ] && [ "$ws_executer" != "null" ]; then
-    local busy_agent busy_change
-    busy_agent="$(printf '%s' "$ws_executer" | jq -r '.name')"
-    busy_change="$(printf '%s' "$ws_executer" | jq -r '.change')"
-    die_json "executer_busy" "workspace $workspace_id already runs executer '$busy_agent' for change '$busy_change'; finish it before dispatching '$change'"
-  fi
+  assert_workspace_free "$workspace_id" "$change"
 
   local -a env_args=()
   while IFS= read -r e; do [ -n "$e" ] && env_args+=(--env "$e"); done < <(runner_env_of "$runner")
@@ -1605,6 +1628,183 @@ cmd_answer() {
     '{change: $change, agent: $agent, keys: $keys, status: $status}')"
 }
 
+# ----------------------------------------------------------------- mission ---
+
+# missions_dir <project> -- directory of the mission docs: '[missions] dir'
+# relative to the project root (default openspec/missions); an absolute or ~
+# path is used as is. A leading ~ is expanded.
+missions_dir() {
+  local project="$1" cfg path
+  cfg="$(config_json)" || return 1
+  path="$(printf '%s' "$cfg" | jq -r '.missions.dir // empty')"
+  [ -n "$path" ] || path="openspec/missions"
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    "~"|"~/"*) expand_home "$path" ;;
+    *) printf '%s/%s\n' "$project" "$path" ;;
+  esac
+}
+
+# mission_file_for <project> <slug> -- path of the mission document
+mission_file_for() {
+  printf '%s/%s.md\n' "$(missions_dir "$1")" "$2"
+}
+
+# mission_parse <file> -- compact JSON {goal, changes:[...]} for a mission doc.
+# List items ('- <change>', optionally indented) are the ordered changes; the
+# remaining prose (headings skipped) is the goal. Returns 1 when the file does
+# not exist.
+mission_parse() {
+  local file="$1" line item goal="" goal_line
+  [ -f "$file" ] || return 1
+  local -a changes=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^[[:space:]]*-[[:space:]]+(.+)$ ]]; then
+      item="${BASH_REMATCH[1]}"
+      item="${item%"${item##*[![:space:]]}"}"
+      [ -n "$item" ] && changes+=("$item")
+    elif [[ "$line" =~ ^[[:space:]]*# ]]; then
+      :
+    else
+      goal_line="${line#"${line%%[![:space:]]*}"}"
+      goal_line="${goal_line%"${goal_line##*[![:space:]]}"}"
+      [ -n "$goal_line" ] && goal="$goal $goal_line"
+    fi
+  done <"$file"
+  goal="${goal# }"
+  local changes_json="[]"
+  [ "${#changes[@]}" -gt 0 ] && changes_json="$(printf '%s\n' "${changes[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  jq -nc --arg goal "$goal" --argjson changes "$changes_json" '{goal: $goal, changes: $changes}'
+}
+
+# cmd_mission_start <slug> <project-name> -- create the mission doc if missing
+cmd_mission_start() {
+  local slug="$1" project_name="$2"
+  ensure_config
+  local project dir file created=false
+  project="$(resolve_project "$project_name")" || exit 1
+  dir="$(missions_dir "$project")"
+  file="$dir/$slug.md"
+  if [ ! -f "$file" ]; then
+    mkdir -p "$dir" || die_json "mission_write" "cannot create missions dir: $dir"
+    printf '# Mission: %s\n\n## Goal\n\nDescribe the goal of this mission: what should exist when it is done.\n\n## Changes\n\n' "$slug" >"$file" \
+      || die_json "mission_write" "cannot write mission file: $file"
+    created=true
+  fi
+  printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg path "$file" \
+    --argjson created "$created" \
+    '{slug: $slug, project: $project, path: $path, status: (if $created then "created" else "exists" end)}')"
+}
+
+# cmd_mission_status <slug> <project-name> -- goal and derived per-change state
+cmd_mission_status() {
+  local slug="$1" project_name="$2"
+  ensure_config
+  local project file
+  project="$(resolve_project "$project_name")" || exit 1
+  file="$(mission_file_for "$project" "$slug")"
+  if [ ! -f "$file" ]; then
+    printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg path "$file" \
+      '{slug: $slug, project: $project, path: $path, status: "mission_missing", goal: null, changes: [], progress: {total: 0, done: 0}}')"
+    return 0
+  fi
+  local parsed goal
+  parsed="$(mission_parse "$file")" || die_json "mission_invalid" "cannot parse mission file $file"
+  goal="$(printf '%s' "$parsed" | jq -r '.goal')"
+  local -a changes=()
+  while IFS= read -r c; do [ -n "$c" ] && changes+=("$c"); done < <(printf '%s' "$parsed" | jq -r '.changes[]')
+  if [ "${#changes[@]}" -eq 0 ]; then
+    printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg path "$file" --arg goal "$goal" \
+      '{slug: $slug, project: $project, path: $path, status: "no_changes", goal: (if $goal == "" then null else $goal end), changes: [], progress: {total: 0, done: 0}}')"
+    return 0
+  fi
+  local json="[]" c st done_count=0
+  for c in "${changes[@]}"; do
+    st="$(mission_done_state "$project" "$c")"
+    json="$(printf '%s' "$json" | jq -c --argjson s "$st" '. + [$s]')"
+    [ "$(printf '%s' "$st" | jq -r '.state')" = "done" ] && done_count=$((done_count + 1))
+  done
+  printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg path "$file" --arg goal "$goal" \
+    --argjson changes "$json" --argjson done "$done_count" \
+    '{slug: $slug, project: $project, path: $path, status: "ok", goal: (if $goal == "" then null else $goal end), changes: $changes, progress: {total: ($changes | length), done: $done}}')"
+}
+
+# cmd_mission_next <slug> <project-name> -- dispatch the first change not done
+cmd_mission_next() {
+  local slug="$1" project_name="$2"
+  ensure_boss_claim dispatch
+  ensure_config
+  local project file
+  project="$(resolve_project "$project_name")" || exit 1
+  file="$(mission_file_for "$project" "$slug")"
+  [ -f "$file" ] || die_json "mission_missing" "mission '$slug' not found at $file; create it with 'boss mission start $slug --project <name|path>'"
+  local parsed
+  parsed="$(mission_parse "$file")" || die_json "mission_invalid" "cannot parse mission file $file"
+  local -a changes=()
+  while IFS= read -r c; do [ -n "$c" ] && changes+=("$c"); done < <(printf '%s' "$parsed" | jq -r '.changes[]')
+  [ "${#changes[@]}" -gt 0 ] || die_json "mission_empty" "mission '$slug' names no changes in $file"
+
+  # One executer per workspace: refuse before choosing, so a running executer is
+  # reported even when the next change is not ready yet.
+  local workspace_id
+  workspace_id="$(find_workspace_for_repo "$project")"
+  [ -n "$workspace_id" ] && assert_workspace_free "$workspace_id"
+
+  local runner
+  runner="$(resolve_runner "")" || exit 1
+
+  local c st target="" target_state=""
+  for c in "${changes[@]}"; do
+    st="$(mission_done_state "$project" "$c")"
+    if [ "$(printf '%s' "$st" | jq -r '.state')" != "done" ]; then
+      target="$c"
+      target_state="$(printf '%s' "$st" | jq -r '.state')"
+      break
+    fi
+  done
+
+  if [ -z "$target" ]; then
+    printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg status "mission_complete" \
+      '{slug: $slug, project: $project, status: $status}')"
+    return 0
+  fi
+
+  if [ "$target_state" = "change_not_ready" ]; then
+    die_json "change_not_ready" "change '$target' in $project has no proposal yet; create it before 'boss mission next' can dispatch it"
+  fi
+
+  dispatch_change "$target" "$project" "$runner" ""
+}
+
+# cmd_mission <action> <slug> [--project <name|path>] -- dispatch the mission
+# subcommands and reject a slug that would escape the missions directory.
+cmd_mission() {
+  local action="" slug="" project_name="" arg
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --project) project_name="${1:-}"; shift ;;
+      -h|--help) usage ;;
+      --*) usage_error "unknown option: $arg" ;;
+      *)
+        if [ -z "$action" ]; then action="$arg"
+        elif [ -z "$slug" ]; then slug="$arg"
+        else usage_error "unexpected argument: $arg"; fi ;;
+    esac
+  done
+  [ -n "$action" ] || usage_error "usage: boss mission start|status|next <slug> [--project <name|path>]"
+  [ -n "$slug" ] || usage_error "usage: boss mission $action <slug> [--project <name|path>]"
+  case "$slug" in
+    */*|*..*) usage_error "invalid mission slug: $slug" ;;
+  esac
+  case "$action" in
+    start) cmd_mission_start "$slug" "$project_name" ;;
+    status) cmd_mission_status "$slug" "$project_name" ;;
+    next) cmd_mission_next "$slug" "$project_name" ;;
+    *) usage_error "unknown mission action: $action" ;;
+  esac
+}
+
 # -------------------------------------------------------------------- main ---
 
 main() {
@@ -1620,6 +1820,7 @@ main() {
     answer) shift; cmd_answer "$@" ;;
     claim) shift; cmd_claim "$@" ;;
     session) shift; cmd_session "$@" ;;
+    mission) shift; cmd_mission "$@" ;;
     -h|--help) usage ;;
     "") usage ;;
     *) usage_error "unknown command: ${1:-}" ;;

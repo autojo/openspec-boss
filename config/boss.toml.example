@@ -60,3 +60,9 @@ shop = "uv run pytest -q"
 [lessons]
 global = "~/.config/openspec-boss/lessons.md"
 project = "openspec/lessons.md"
+
+# Optional: the directory of the mission docs, relative to the project root
+# (default openspec/missions); an absolute or ~ path is used as is and a
+# leading ~ is expanded. A configuration without this table keeps the default.
+[missions]
+dir = "openspec/missions"
