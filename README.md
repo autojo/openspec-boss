@@ -133,6 +133,7 @@ boss finish <change> [--project <name|path>] [--force] [--lesson <text>] [--less
 boss answer <change> <key>... [--project <name|path>]
 boss claim [--name <name>] [--release]
 boss session [--project <name|path>] [--runner <name>]
+boss skills dir [--project <name|path>] [--json]
 boss mission start <slug> --project <name|path>
 boss mission status <slug> [--project <name|path>]
 boss mission next <slug> [--project <name|path>]
@@ -199,14 +200,19 @@ boss config-json
   live-derived state; `next` dispatches the first change not yet `done` through
   the normal `dispatch` path and reports `mission_complete`, `executer_busy` or
   `change_not_ready`.
+- `skills dir` prints where skills live: the project-scoped directories of both
+  tools (`.opencode/skills`, `.claude/skills`) and the machine-global ones. Use
+  it when the Explorer writes a verified procedure as a skill (see
+  [Skills from experience](#skills-from-experience)).
 
 All commands print JSON; errors appear as JSON on stderr with exit status 1
 (like Herdr). The tools provide thin slash commands:
 `/boss:dispatch`, `/boss:session`, `/boss:status`, `/boss:wait`,
-`/boss:retrigger`, `/boss:finish`, `/boss:claim` (Claude Code) or
-`/boss-dispatch`, `/boss-session`, `/boss-status`, `/boss-wait`,
-`/boss-retrigger`, `/boss-finish`, `/boss-claim` (OpenCode), which simply call
-the `boss` command of the same name.
+`/boss:retrigger`, `/boss:finish`, `/boss:claim`, `/boss:mission`,
+`/boss:skills` (Claude Code) or `/boss-dispatch`, `/boss-session`,
+`/boss-status`, `/boss-wait`, `/boss-retrigger`, `/boss-finish`, `/boss-claim`,
+`/boss-mission`, `/boss-skills` (OpenCode), which simply call the `boss`
+command of the same name.
 
 ## Configuration (`~/.config/openspec-boss/boss.toml`)
 
