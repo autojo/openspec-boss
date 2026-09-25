@@ -418,13 +418,22 @@ On a fresh server:
 
 ```bash
 herdr integration install claude opencode   # if missing
-git clone <this-repo> && cd openspec-boss
+git clone <this-repo> "${XDG_DATA_HOME:-$HOME/.local/share}/openspec-boss"
+cd "${XDG_DATA_HOME:-$HOME/.local/share}/openspec-boss"
 ./install.sh
 ```
 
+`${XDG_DATA_HOME:-$HOME/.local/share}/openspec-boss` is the suggested clone
+location: it is user-local, survives shell changes, and needs no `~/work`
+directory. The location is only a recommendation – `install.sh` works from any
+clone directory, because it derives the repository path from its own location
+and links everything by absolute path.
+
 `install.sh` links the skill and commands into `~/.claude/` and
 `~/.config/opencode/`, creates `~/.local/bin/boss`, generates
-`~/.config/openspec-boss/` and checks the prerequisites. It is idempotent:
+`~/.config/openspec-boss/` and checks the prerequisites. It prints the
+resolved repository path and warns when `~/.local/bin` is not in `PATH`,
+naming the line to add to your shell configuration. It is idempotent:
 `git pull && ./install.sh` is enough for updates. Existing foreign files at
 the target locations are reported, never overwritten. Remove again with
 `./install.sh --uninstall` (config and state are kept).

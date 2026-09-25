@@ -107,6 +107,7 @@ print(" ".join(sorted(data.get("runners", {}))))' "$CONFIG_DIR/boss.toml" 2>/dev
 }
 
 install_all() {
+  info "repository: $REPO_DIR"
   link_symlink "$REPO_DIR/skills/boss" "$CLAUDE_DIR/skills/boss"
   link_symlink "$REPO_DIR/skills/boss" "$OPENCODE_DIR/skills/boss"
   link_symlink "$REPO_DIR/commands/claude/boss" "$CLAUDE_DIR/commands/boss"
@@ -116,6 +117,16 @@ install_all() {
     link_symlink "$f" "$OPENCODE_DIR/commands/$(basename "$f")"
   done
   link_symlink "$REPO_DIR/bin/boss" "$BIN_LINK"
+  local bin_dir
+  bin_dir="$(dirname "$BIN_LINK")"
+  case ":$PATH:" in
+    *":$bin_dir:"*) ;;
+    *)
+      warn "$bin_dir is not in PATH; boss will not be found in new shells"
+      warn 'add this line to your shell configuration:'
+      warn 'export PATH="$HOME/.local/bin:$PATH"'
+      ;;
+  esac
   mkdir -p "$CONFIG_DIR" || {
     fail "cannot create $CONFIG_DIR"
     CONFLICTS=$((CONFLICTS + 1))
