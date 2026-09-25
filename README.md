@@ -405,13 +405,18 @@ scoping there remains `--permission-mode bypassPermissions` on the runner.
 - **OpenSpec ≥ 1.13**, initialized for both tools in every target project
   (`openspec init --tools claude,opencode`), otherwise the apply agent does
   not know its command.
-- **jq**, **bash ≥ 4**, **python3 ≥ 3.11** (only for `tomllib`), **setsid**
-  (util-linux, for the detached waiter).
+- **jq**, **bash ≥ 4**, **python3 ≥ 3.11** (only for `tomllib`), **`setsid`**
+  or **`nohup`** (for the detached waiter; `setsid` is used when present).
 - **OpenCode** – the global `"permission"` setting is left untouched. The
   scoped grant lives in `OPENCODE_CONFIG_CONTENT` on the boss tabs; see
   [Limiting permissions to the workspace](#limiting-permissions-to-the-workspace).
 - Target projects need `.claude/commands/opsx/` and
   `.opencode/commands/opsx-*.md` (created by `openspec init`).
+
+boss also runs on macOS: the waiter is detached with `nohup` when `setsid` is
+missing, and script paths and `started_at` timestamps are resolved without
+GNU-only options (`readlink -f`, `date -d`). No extra packages such as GNU
+coreutils are needed.
 
 ## Installation
 

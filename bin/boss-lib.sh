@@ -42,6 +42,28 @@ now_iso() {
   date '+%Y-%m-%dT%H:%M:%S%z'
 }
 
+# epoch_of_iso <iso> -- epoch seconds for a timestamp in the format now_iso
+# emits (YYYY-MM-DDTHH:MM:SS+ZZZZ). Tries GNU 'date -d' first and falls back
+# to BSD 'date -j -f' (macOS), which has no '-d'. Prints nothing when neither
+# parser understands the value, so callers keep a missing/odd timestamp neutral.
+epoch_of_iso() {
+  local iso="${1:-}" out
+  [ -n "$iso" ] || return 0
+  out="$(date -d "$iso" +%s 2>/dev/null || true)"
+  if [ -z "$out" ]; then
+    out="$(date -j -f '%Y-%m-%dT%H:%M:%S%z' "$iso" +%s 2>/dev/null || true)"
+  fi
+  [ -n "$out" ] && printf '%s' "$out"
+}
+
+# now_ms -- current time in milliseconds since the epoch. BSD/macOS 'date' has
+# no '%N', so this multiplies whole seconds by 1000 instead. Every deadline and
+# every comparison uses this same helper, so the coarser resolution is
+# consistent and timeouts keep working.
+now_ms() {
+  printf '%s\n' "$(( $(date +%s) * 1000 ))"
+}
+
 log() {
   local line
   line="$(now_iso) $*"
@@ -105,6 +127,20 @@ normalize_name() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9_-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//'
 }
 
+# sha1_hex <text> -- lowercase hex SHA1 of <text>. Prefers GNU 'sha1sum' and
+# falls back to BSD/macOS 'shasum -a 1' (macOS has no sha1sum), so no extra
+# package is needed. Prints nothing when neither tool exists.
+sha1_hex() {
+  local text="${1:-}"
+  if command -v sha1sum >/dev/null 2>&1; then
+    printf '%s' "$text" | sha1sum | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$text" | shasum -a 1 | cut -d' ' -f1
+  else
+    return 1
+  fi
+}
+
 # apply_agent_name <change> -- herdr agent name for a change's apply.
 # Herdr allows [a-z][a-z0-9_-]{0,31}; "apply-<change>" is used when it fits,
 # otherwise "apply-" + the first 19 characters + "-" + 6 hex of sha1(change)
@@ -118,7 +154,7 @@ apply_agent_name() {
     return 0
   fi
   head="$(printf '%s' "$norm" | cut -c1-19 | sed -e 's/[-_]*$//')"
-  hash="$(printf '%s' "$norm" | sha1sum | cut -c1-6)"
+  hash="$(sha1_hex "$norm" | cut -c1-6)"
   printf 'apply-%s-%s\n' "$head" "$hash"
 }
 
@@ -140,7 +176,7 @@ boss_name_for() {
     return 0
   fi
   head="$(printf '%s' "$norm" | cut -c1-19 | sed -e 's/[-_]*$//')"
-  hash="$(printf '%s' "$norm" | sha1sum | cut -c1-6)"
+  hash="$(sha1_hex "$norm" | cut -c1-6)"
   printf 'boss-%s-%s\n' "$head" "$hash"
 }
 
@@ -394,7 +430,7 @@ write_state_field() {
 # state_file_for <project-path> <change> -- path of the state file for an apply
 state_file_for() {
   local project="$1" change="$2" hash
-  hash="$(printf '%s' "$project" | sha1sum | cut -d' ' -f1)"
+  hash="$(sha1_hex "$project")"
   printf '%s/%s-%s.json\n' "$BOSS_APPLIES_DIR" "$hash" "$(normalize_name "$change")"
 }
 
@@ -402,7 +438,7 @@ state_file_for() {
 # applies of this change in this project (same keying as state_file_for).
 events_file_for() {
   local project="$1" change="$2" hash
-  hash="$(printf '%s' "$project" | sha1sum | cut -d' ' -f1)"
+  hash="$(sha1_hex "$project")"
   printf '%s/%s-%s.events.jsonl\n' "$BOSS_CYCLES_DIR" "$hash" "$(normalize_name "$change")"
 }
 
@@ -535,13 +571,45 @@ expand_home() {
   esac
 }
 
+# resolve_path <path> -- print the absolute, symlink-resolved path without
+# relying on 'readlink -f' (macOS has no -f). The symlink chain is walked by
+# hand: a relative target is taken relative to the link's directory, and the
+# final directory is made physical with 'pwd -P'. A path that does not exist is
+# returned expanded but unresolved, so error messages can still show it.
+resolve_path() {
+  local p resolved target dir hops=0
+  p="$(expand_home "$1")"
+  case "$p" in
+    /*) ;;
+    *) p="$PWD/$p" ;;
+  esac
+  while [ -L "$p" ] && [ "$hops" -lt 40 ]; do
+    hops=$((hops + 1))
+    target="$(readlink "$p" 2>/dev/null)" || break
+    case "$target" in
+      /*) p="$target" ;;
+      *) p="$(dirname "$p")/$target" ;;
+    esac
+  done
+  if [ -d "$p" ]; then
+    resolved="$(cd "$p" 2>/dev/null && pwd -P)" && {
+      printf '%s' "$resolved"
+      return 0
+    }
+  fi
+  dir="$(dirname "$p")"
+  if resolved="$(cd "$dir" 2>/dev/null && pwd -P)"; then
+    printf '%s/%s' "$resolved" "$(basename "$p")"
+  else
+    printf '%s' "$p"
+  fi
+}
+
 # canonical_path <path> -- absolute, resolved path (no symlink components).
 # A path that does not exist is returned expanded but unresolved, so error
 # messages can still show it.
 canonical_path() {
-  local p
-  p="$(expand_home "$1")"
-  (cd "$p" 2>/dev/null && pwd) || readlink -f "$p" 2>/dev/null || printf '%s' "$p"
+  resolve_path "$1"
 }
 
 # herdr_raw <method> <params-json> -- call the Herdr socket API directly.

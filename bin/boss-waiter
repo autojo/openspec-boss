@@ -6,9 +6,23 @@
 
 set -u
 
-BIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Find and source boss-lib.sh without 'readlink -f' (macOS has no -f): walk
+# this script's symlink chain, then let the library's resolve_path finalize
+# BIN_DIR. BASH_SOURCE[0] may be a symlink, so the library is not next to the
+# invoked path.
+BOSS_SELF="${BASH_SOURCE[0]}"
+while [ -L "$BOSS_SELF" ]; do
+  BOSS_LINK="$(readlink "$BOSS_SELF" 2>/dev/null)" || break
+  case "$BOSS_LINK" in
+    /*) BOSS_SELF="$BOSS_LINK" ;;
+    *) BOSS_SELF="$(dirname "$BOSS_SELF")/$BOSS_LINK" ;;
+  esac
+done
+BOSS_LIB_DIR="$(cd "$(dirname "$BOSS_SELF")" && pwd -P)" || exit 1
 # shellcheck source=./boss-lib.sh
-. "$BIN_DIR/boss-lib.sh"
+. "$BOSS_LIB_DIR/boss-lib.sh"
+BIN_DIR="$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")"
+unset BOSS_SELF BOSS_LINK BOSS_LIB_DIR
 
 state_file="${1:-}"
 if [ -z "$state_file" ] || [ ! -f "$state_file" ]; then

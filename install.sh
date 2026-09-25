@@ -5,7 +5,22 @@
 
 set -u
 
-REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Resolve the repository path portably: source bin/boss-lib.sh first, because
+# its resolve_path helper replaces 'readlink -f' (macOS has no -f). install.sh
+# is run from the repository root, so the library sits at bin/boss-lib.sh.
+BOSS_SELF="${BASH_SOURCE[0]}"
+while [ -L "$BOSS_SELF" ]; do
+  BOSS_LINK="$(readlink "$BOSS_SELF" 2>/dev/null)" || break
+  case "$BOSS_LINK" in
+    /*) BOSS_SELF="$BOSS_LINK" ;;
+    *) BOSS_SELF="$(dirname "$BOSS_SELF")/$BOSS_LINK" ;;
+  esac
+done
+BOSS_REPO_BOOT="$(cd "$(dirname "$BOSS_SELF")" && pwd -P)" || exit 1
+# shellcheck source=bin/boss-lib.sh
+. "$BOSS_REPO_BOOT/bin/boss-lib.sh"
+REPO_DIR="$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")"
+unset BOSS_SELF BOSS_LINK BOSS_REPO_BOOT
 
 CLAUDE_DIR="$HOME/.claude"
 OPENCODE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
@@ -24,7 +39,7 @@ CONFLICTS=0
 link_symlink() {
   local src="$1" dest="$2"
   if [ -L "$dest" ]; then
-    if [ "$(readlink -f "$dest")" = "$(readlink -f "$src")" ]; then
+    if [ "$(resolve_path "$dest")" = "$(resolve_path "$src")" ]; then
       return 0
     fi
     warn "$dest already exists as a symlink to $(readlink "$dest"); leaving it alone"
@@ -148,7 +163,7 @@ uninstall_all() {
   remove_link() {
     local dest="$1" src="$2"
     if [ -L "$dest" ]; then
-      if [ "$(readlink -f "$dest")" = "$(readlink -f "$src")" ]; then
+      if [ "$(resolve_path "$dest")" = "$(resolve_path "$src")" ]; then
         rm -f "$dest" && info "removed $dest"
       else
         warn "$dest points elsewhere; leaving it alone"

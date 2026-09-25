@@ -4,9 +4,23 @@
 
 set -u
 
-BIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Find and source boss-lib.sh without 'readlink -f' (macOS has no -f): walk
+# this script's symlink chain, then let the library's resolve_path finalize
+# BIN_DIR. BASH_SOURCE[0] may be the ~/.local/bin/boss symlink, not the real
+# file, so the library is not next to the invoked path.
+BOSS_SELF="${BASH_SOURCE[0]}"
+while [ -L "$BOSS_SELF" ]; do
+  BOSS_LINK="$(readlink "$BOSS_SELF" 2>/dev/null)" || break
+  case "$BOSS_LINK" in
+    /*) BOSS_SELF="$BOSS_LINK" ;;
+    *) BOSS_SELF="$(dirname "$BOSS_SELF")/$BOSS_LINK" ;;
+  esac
+done
+BOSS_LIB_DIR="$(cd "$(dirname "$BOSS_SELF")" && pwd -P)" || exit 1
 # shellcheck source=./boss-lib.sh
-. "$BIN_DIR/boss-lib.sh"
+. "$BOSS_LIB_DIR/boss-lib.sh"
+BIN_DIR="$(dirname "$(resolve_path "${BASH_SOURCE[0]}")")"
+unset BOSS_SELF BOSS_LINK BOSS_LIB_DIR
 
 usage() {
   cat >&2 <<'EOF'
@@ -444,7 +458,7 @@ cmd_session() {
 
   # Start the agent, retrying while the fresh shell pane is still busy.
   local started=0 deadline out rc code=""
-  deadline=$(( $(date +%s%3N) + BOSS_AGENT_BUSY_RETRY_MS ))
+  deadline=$(( $(now_ms) + BOSS_AGENT_BUSY_RETRY_MS ))
   while :; do
     if [ "${#agent_args[@]}" -gt 0 ]; then
       out="$(herdr agent start "$agent_name" --kind "$kind" --pane "$pane_id" --timeout "$BOSS_AGENT_START_TIMEOUT_MS" -- "${agent_args[@]}" 2>&1)"
@@ -458,7 +472,7 @@ cmd_session() {
     fi
     code="$(printf '%s' "$out" | jq -r '.error.code // ""' 2>/dev/null || true)"
     [ "$code" = "agent_pane_busy" ] || break
-    [ "$(date +%s%3N)" -lt "$deadline" ] || break
+    [ "$(now_ms)" -lt "$deadline" ] || break
     log "agent start for $agent_name hit a busy pane; retrying"
     sleep 1
   done
@@ -648,7 +662,7 @@ await_runner_ready() {
 # BOSS_AGENT_PROMPT_TIMEOUT_MS is used up.
 send_prompt() {
   local agent="$1" text="$2" out rc code deadline wait_s now
-  deadline=$(( $(date +%s%3N) + BOSS_AGENT_PROMPT_TIMEOUT_MS ))
+  deadline=$(( $(now_ms) + BOSS_AGENT_PROMPT_TIMEOUT_MS ))
   wait_s=2
   while :; do
     out="$(herdr agent prompt "$agent" "$text" --wait --until working --timeout 30000 2>&1)"
@@ -659,7 +673,7 @@ send_prompt() {
     code="$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null || true)"
     case "$code" in
       agent_prompt_stalled|timeout)
-        now="$(date +%s%3N)"
+        now="$(now_ms)"
         [ "$now" -lt "$deadline" ] || break
         log "prompt did not take effect yet ($code); retrying in ${wait_s}s"
         sleep "$wait_s"
@@ -765,7 +779,7 @@ dispatch_change() {
 
   # Start the agent, retrying while the fresh shell pane is still busy.
   local started=0 deadline out rc code=""
-  deadline=$(( $(date +%s%3N) + BOSS_AGENT_BUSY_RETRY_MS ))
+  deadline=$(( $(now_ms) + BOSS_AGENT_BUSY_RETRY_MS ))
   # Always try at least once, then keep retrying busy panes until the deadline.
   while :; do
     if [ "${#agent_args[@]}" -gt 0 ]; then
@@ -780,7 +794,7 @@ dispatch_change() {
     fi
     code="$(printf '%s' "$out" | jq -r '.error.code // ""' 2>/dev/null || true)"
     [ "$code" = "agent_pane_busy" ] || break
-    [ "$(date +%s%3N)" -lt "$deadline" ] || break
+    [ "$(now_ms)" -lt "$deadline" ] || break
     log "agent start for $agent_name hit a busy pane; retrying"
     sleep 1
   done
@@ -1266,7 +1280,7 @@ cmd_review() {
     note="$(jq -r '.note // ""' "$state_file")"
     started_at="$(jq -r '.started_at // ""' "$state_file")"
     if [ -n "$started_at" ]; then
-      started_epoch="$(date -d "$started_at" +%s 2>/dev/null || true)"
+      started_epoch="$(epoch_of_iso "$started_at")"
       [ -n "$started_epoch" ] && duration_s=$(( $(date +%s) - started_epoch ))
     fi
   fi
@@ -1541,7 +1555,7 @@ cmd_finish() {
   duration_s=null
   if [ -n "$started_at" ]; then
     local started_epoch
-    started_epoch="$(date -d "$started_at" +%s 2>/dev/null || true)"
+    started_epoch="$(epoch_of_iso "$started_at")"
     [ -n "$started_epoch" ] && duration_s=$(( $(date +%s) - started_epoch ))
   fi
   tasks_open=null
