@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh -- install (or uninstall) the openspec-boss into Claude Code and
 # OpenCode. Idempotent: run again after `git pull` on any machine.
-# Usage: ./install.sh [--uninstall]
+# Usage: ./install.sh [--add-to-path] [--uninstall]
 
 set -u
 
@@ -33,6 +33,67 @@ fail() { printf 'install: error: %s\n' "$*" >&2; }
 
 CHANGED=0
 CONFLICTS=0
+
+# Marker line that identifies the PATH block this installer owns. It is
+# matched literally so an existing (maybe hand-edited) block is never doubled.
+PATH_MARKER='# openspec-boss: add ~/.local/bin to PATH'
+PATH_EXPORT_LINE='case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
+
+# path_rc_file -- the shell configuration that the interactive shell reads.
+path_rc_file() {
+  case "$(basename "${SHELL:-}")" in
+    zsh) printf '%s' "$HOME/.zshrc" ;;
+    bash) printf '%s' "$HOME/.bashrc" ;;
+    *) printf '%s' "$HOME/.profile" ;;
+  esac
+}
+
+# add_to_path -- append the marked PATH block idempotently. A second run that
+# finds the marker writes nothing.
+add_to_path() {
+  local rc
+  rc="$(path_rc_file)"
+  if [ -f "$rc" ] && grep -Fq -- "$PATH_MARKER" "$rc"; then
+    info "$rc already adds ~/.local/bin to PATH"
+    return 0
+  fi
+  {
+    printf '\n%s\n' "$PATH_MARKER"
+    printf '%s\n' "$PATH_EXPORT_LINE"
+  } >> "$rc" || {
+    fail "cannot write $rc"
+    CONFLICTS=$((CONFLICTS + 1))
+    return 1
+  }
+  info "added ~/.local/bin to PATH in $rc (open a new shell to use it)"
+  CHANGED=$((CHANGED + 1))
+}
+
+# remove_from_path -- drop the marker line and the line directly after it.
+remove_from_path() {
+  local rc tmp
+  rc="$(path_rc_file)"
+  [ -f "$rc" ] || return 0
+  grep -Fq -- "$PATH_MARKER" "$rc" || return 0
+  tmp="$(mktemp)" || {
+    warn "cannot create a temporary file to edit $rc"
+    return 1
+  }
+  if awk -v marker="$PATH_MARKER" '
+    skip { skip = 0; next }
+    $0 == marker { skip = 1; next }
+    { print }
+  ' "$rc" > "$tmp"; then
+    cat "$tmp" > "$rc"
+    rm -f "$tmp"
+    info "removed the openspec-boss PATH entry from $rc"
+    CHANGED=$((CHANGED + 1))
+  else
+    rm -f "$tmp"
+    warn "cannot update $rc"
+    return 1
+  fi
+}
 
 # link_symlink <src> <dest> -- create a symlink unless a foreign file exists.
 # Returns 0 when the link exists (or was created), 1 on conflict/failure.
@@ -147,9 +208,27 @@ install_all() {
   case ":$PATH:" in
     *":$bin_dir:"*) ;;
     *)
-      warn "$bin_dir is not in PATH; boss will not be found in new shells"
-      warn 'add this line to your shell configuration:'
-      warn 'export PATH="$HOME/.local/bin:$PATH"'
+      if [ "${ADD_TO_PATH:-0}" -eq 1 ]; then
+        add_to_path
+      elif [ -t 0 ] && [ -t 1 ]; then
+        printf 'install: %s is not in PATH; add it to your shell configuration now? [y/N] ' "$bin_dir"
+        local answer=""
+        read -r answer || answer=""
+        case "$answer" in
+          [yY] | [yY][eE][sS]) add_to_path ;;
+          *)
+            warn "$bin_dir is not in PATH; boss will not be found in new shells"
+            warn 'add this line to your shell configuration:'
+            warn 'export PATH="$HOME/.local/bin:$PATH"'
+            warn 'or run: ./install.sh --add-to-path'
+            ;;
+        esac
+      else
+        warn "$bin_dir is not in PATH; boss will not be found in new shells"
+        warn 'add this line to your shell configuration:'
+        warn 'export PATH="$HOME/.local/bin:$PATH"'
+        warn 'or run: ./install.sh --add-to-path'
+      fi
       ;;
   esac
   mkdir -p "$CONFIG_DIR" || {
@@ -180,22 +259,31 @@ uninstall_all() {
     remove_link "$OPENCODE_DIR/commands/$(basename "$f")" "$f"
   done
   remove_link "$BIN_LINK" "$REPO_DIR/bin/boss"
+  remove_from_path
   info "uninstall done (config in $CONFIG_DIR and state under ${XDG_STATE_HOME:-$HOME/.local/state}/openspec-boss were kept)"
 }
 
 main() {
-  if [ "${1:-}" = "--uninstall" ]; then
-    uninstall_all
-    exit 0
-  fi
-  if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-    printf 'usage: %s [--uninstall]\n' "$0"
-    exit 0
-  fi
-  [ -z "${1:-}" ] || {
-    fail "unknown argument: $1"
-    exit 2
-  }
+  ADD_TO_PATH=0
+  case "${1:-}" in
+    --uninstall)
+      uninstall_all
+      exit 0
+      ;;
+    -h | --help)
+      printf 'usage: %s [--add-to-path] [--uninstall]\n' "$0"
+      exit 0
+      ;;
+    --add-to-path)
+      ADD_TO_PATH=1
+      ;;
+    "")
+      ;;
+    *)
+      fail "unknown argument: $1"
+      exit 2
+      ;;
+  esac
 
   check_prereqs || exit 1
   check_integrations || exit 1

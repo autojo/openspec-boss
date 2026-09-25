@@ -429,7 +429,7 @@ herdr integration install claude            # if missing
 herdr integration install opencode          # if missing
 git clone https://github.com/autojo/openspec-boss.git "$HOME/.local/share/openspec-boss"
 cd "$HOME/.local/share/openspec-boss"
-./install.sh
+./install.sh --add-to-path
 ```
 
 `$HOME/.local/share/openspec-boss` is the suggested clone location: it is
@@ -448,6 +448,15 @@ naming the line to add to your shell configuration. It is idempotent:
 `git pull && ./install.sh` is enough for updates. Existing foreign files at
 the target locations are reported, never overwritten. Remove again with
 `./install.sh --uninstall` (config and state are kept).
+
+`--add-to-path` writes the missing `~/.local/bin` entry into the shell
+configuration (`~/.zshrc` for zsh, `~/.bashrc` for bash, otherwise
+`~/.profile`) as a marked, `case`-guarded line; a second run adds nothing.
+Without the flag, `install.sh` asks at an interactive terminal whether it
+should add the line and stays a hint in non-interactive runs. This matters on
+macOS in particular, where `~/.local/bin` is usually not in the default
+`PATH`; open a new terminal afterwards so the change takes effect.
+`./install.sh --uninstall` removes the marked line again.
 
 ## Starting the boss session
 
