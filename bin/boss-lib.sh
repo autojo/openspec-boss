@@ -598,3 +598,16 @@ kill_waiter() {
   fi
   return 1
 }
+
+# detach_waiter <state-file> -- start the waiter detached from this process so
+# it survives the dispatch command. Uses setsid (own session) when available
+# and falls back to nohup + background on systems without setsid (macOS).
+# BIN_DIR is set by the caller (bin/boss).
+detach_waiter() {
+  local state_file="$1"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid -f "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1
+  else
+    nohup "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1 &
+  fi
+}

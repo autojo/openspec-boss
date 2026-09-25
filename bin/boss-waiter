@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# boss-waiter -- detached watcher for one apply. Started via setsid by
-# 'boss dispatch' / 'boss retrigger'; survives the calling shell.
+# boss-waiter -- detached watcher for one apply. Started detached (setsid, or
+# nohup where setsid is missing) by 'boss dispatch' / 'boss retrigger'; it
+# survives the calling shell.
 # Usage: boss-waiter <state-file>
 
 set -u

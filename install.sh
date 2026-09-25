@@ -53,12 +53,22 @@ link_symlink() {
 
 check_prereqs() {
   local missing=0 cmd
-  for cmd in herdr openspec jq setsid python3; do
+  for cmd in herdr openspec jq python3; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       fail "missing prerequisite: '$cmd' is not in PATH"
       missing=$((missing + 1))
     fi
   done
+  # The waiter is detached with setsid when available, otherwise with nohup
+  # (macOS has no setsid). At least one of them must exist.
+  if ! command -v setsid >/dev/null 2>&1; then
+    if command -v nohup >/dev/null 2>&1; then
+      info "setsid not found; the waiter will be detached with nohup"
+    else
+      fail "missing prerequisite: need 'setsid' or 'nohup' to detach the waiter"
+      missing=$((missing + 1))
+    fi
+  fi
   if command -v python3 >/dev/null 2>&1; then
     if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
       fail "python3 3.11 or newer is required (tomllib)"

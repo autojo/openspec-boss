@@ -92,7 +92,7 @@ Markdown file in the target project with the goal in prose and the changes in
 execution order, one `- <change>` per line:
 
 ```markdown
-# Mission: crawl-ausbau
+# Mission: crawl-expansion
 
 ## Goal
 
@@ -400,7 +400,8 @@ scoping there remains `--permission-mode bypassPermissions` on the runner.
 ## Dependencies
 
 - **Herdr ≥ 0.9** with installed integrations for every runner kind in use
-  (`herdr integration install claude opencode`); `install.sh` checks this.
+  (`herdr integration install claude`, `herdr integration install opencode`);
+  `install.sh` checks this.
 - **OpenSpec ≥ 1.13**, initialized for both tools in every target project
   (`openspec init --tools claude,opencode`), otherwise the apply agent does
   not know its command.
@@ -417,8 +418,9 @@ scoping there remains `--permission-mode bypassPermissions` on the runner.
 On a fresh server:
 
 ```bash
-herdr integration install claude opencode   # if missing
-git clone <this-repo> "${XDG_DATA_HOME:-$HOME/.local/share}/openspec-boss"
+herdr integration install claude            # if missing
+herdr integration install opencode          # if missing
+git clone https://github.com/autojo/openspec-boss.git "${XDG_DATA_HOME:-$HOME/.local/share}/openspec-boss"
 cd "${XDG_DATA_HOME:-$HOME/.local/share}/openspec-boss"
 ./install.sh
 ```

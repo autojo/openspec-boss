@@ -825,7 +825,7 @@ dispatch_change() {
     '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, boss: $boss, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at}' \
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"
 
-  setsid -f "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1
+  detach_waiter "$state_file"
   BOSS_FAILED_TAB=""
 
   log "dispatch: change=$change project=$project runner=$runner_name_out agent=$agent_name tab=$tab_id pane=$pane_id workspace=$workspace_id"
@@ -1354,7 +1354,7 @@ ensure_waiter() {
     printf '%s running\n' "$pid"
     return 0
   fi
-  setsid -f "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1
+  detach_waiter "$state_file"
   # The waiter records its pid in the state file shortly after start.
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do
