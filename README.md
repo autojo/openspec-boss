@@ -418,15 +418,19 @@ scoping there remains `--permission-mode bypassPermissions` on the runner.
 On a fresh server:
 
 ```bash
+cd "$HOME"
+mkdir -p "$HOME/.local/share"
 herdr integration install claude            # if missing
 herdr integration install opencode          # if missing
-git clone https://github.com/autojo/openspec-boss.git "${XDG_DATA_HOME:-$HOME/.local/share}/openspec-boss"
-cd "${XDG_DATA_HOME:-$HOME/.local/share}/openspec-boss"
+git clone https://github.com/autojo/openspec-boss.git "$HOME/.local/share/openspec-boss"
+cd "$HOME/.local/share/openspec-boss"
 ./install.sh
 ```
 
-`${XDG_DATA_HOME:-$HOME/.local/share}/openspec-boss` is the suggested clone
-location: it is user-local, survives shell changes, and needs no `~/work`
+`$HOME/.local/share/openspec-boss` is the suggested clone location: it is
+user-local, survives shell changes, and needs no `~/work/<project>` directory.
+The commands start in `$HOME` and create `~/.local/share` first, so they also
+work when that directory is missing or the shell sits in a deleted working
 directory. The location is only a recommendation – `install.sh` works from any
 clone directory, because it derives the repository path from its own location
 and links everything by absolute path.
