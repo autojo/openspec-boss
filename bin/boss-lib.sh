@@ -12,6 +12,15 @@ BOSS_LOGS_DIR="$BOSS_STATE_DIR/logs"
 BOSS_CYCLES_DIR="$BOSS_STATE_DIR/cycles"
 BOSS_BOSSES_DIR="$BOSS_STATE_DIR/bosses"
 
+# cpu_count -- number of online CPUs, or 1 when it cannot be determined.
+cpu_count() {
+  local n
+  n="$(nproc 2>/dev/null || true)"
+  [ -n "$n" ] || n="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  [ -n "$n" ] || n=1
+  printf '%s\n' "$n"
+}
+
 # --- Tunables ---
 BOSS_AGENT_NAME="${BOSS_AGENT_NAME:-boss}"
 BOSS_WAITER_MAX_S="${BOSS_WAITER_MAX_S:-7200}"
@@ -22,6 +31,17 @@ BOSS_AGENT_PROMPT_TIMEOUT_MS="${BOSS_AGENT_PROMPT_TIMEOUT_MS:-90000}"
 BOSS_RUNNER_READY_TIMEOUT_MS="${BOSS_RUNNER_READY_TIMEOUT_MS:-90000}"
 BOSS_REVIEW_TEST_TIMEOUT_S="${BOSS_REVIEW_TEST_TIMEOUT_S:-300}"
 BOSS_WAITER_STALL_MS="${BOSS_WAITER_STALL_MS:-2700000}"
+# Resource notice before 'boss dispatch': warn (never block) when the number of
+# open applies, the free memory or the 1-minute load reaches a threshold.
+# BOSS_DISPATCH_MAX_LOAD defaults to the number of CPUs.
+BOSS_DISPATCH_MAX_APPLIES="${BOSS_DISPATCH_MAX_APPLIES:-3}"
+BOSS_DISPATCH_MIN_FREE_MB="${BOSS_DISPATCH_MIN_FREE_MB:-1024}"
+BOSS_DISPATCH_MAX_LOAD="${BOSS_DISPATCH_MAX_LOAD:-$(cpu_count)}"
+# The resource helpers read these files; overridable so a system without /proc
+# (macOS) or a test can point them elsewhere. A missing or unreadable file drops
+# the respective check instead of failing.
+BOSS_MEMINFO_FILE="${BOSS_MEMINFO_FILE:-/proc/meminfo}"
+BOSS_LOADAVG_FILE="${BOSS_LOADAVG_FILE:-/proc/loadavg}"
 # Caps for the lessons block injected into an apply prompt: at most this many
 # active lesson lines and this many characters, taken global-first.
 BOSS_LESSONS_MAX="${BOSS_LESSONS_MAX:-20}"
@@ -724,6 +744,68 @@ PY
     die_json "$code" "herdr ${method}: ${msg:-socket call failed (exit $rc)}"
   fi
   printf '%s' "$out" | jq -c '.result'
+}
+
+# ------------------------------------------------------------- resources ---
+
+# open_apply_count -- number of state files in $BOSS_APPLIES_DIR, i.e. one per
+# open apply ('boss finish' removes the state file).
+open_apply_count() {
+  local n
+  n="$(ls "$BOSS_APPLIES_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')"
+  printf '%s\n' "${n:-0}"
+}
+
+# free_mem_mb -- MemAvailable from BOSS_MEMINFO_FILE (/proc/meminfo) in MB, or
+# nothing when the file is missing/unreadable or carries no MemAvailable line.
+free_mem_mb() {
+  local kb
+  [ -r "$BOSS_MEMINFO_FILE" ] || return 0
+  kb="$(awk '/^MemAvailable:/ {print $2; exit}' "$BOSS_MEMINFO_FILE" 2>/dev/null || true)"
+  [ -n "$kb" ] || return 0
+  printf '%s\n' "$(( kb / 1024 ))"
+}
+
+# load_1min -- the 1-minute load average as a decimal, read from
+# BOSS_LOADAVG_FILE (/proc/loadavg) and otherwise from 'uptime'; nothing when
+# neither source yields a value.
+load_1min() {
+  local first up
+  if [ -r "$BOSS_LOADAVG_FILE" ]; then
+    read -r first _ <"$BOSS_LOADAVG_FILE" 2>/dev/null || true
+    if [ -n "${first:-}" ]; then
+      printf '%s\n' "$first"
+      return 0
+    fi
+  fi
+  command -v uptime >/dev/null 2>&1 || return 0
+  up="$(uptime 2>/dev/null || true)"
+  first="$(printf '%s' "$up" | sed -n 's/.*load average[s]*:[[:space:]]*\([0-9.][0-9.]*\).*/\1/p')"
+  [ -n "$first" ] && printf '%s\n' "$first"
+  return 0
+}
+
+# resource_warning -- one-line, non-blocking notice for 'boss dispatch' naming
+# every resource whose threshold is reached: open applies >=
+# BOSS_DISPATCH_MAX_APPLIES, free memory < BOSS_DISPATCH_MIN_FREE_MB, 1-minute
+# load >= BOSS_DISPATCH_MAX_LOAD. Prints nothing when every value is within
+# budget or cannot be measured. Never fails.
+resource_warning() {
+  local parts="" n free load
+  n="$(open_apply_count)"
+  if [ -n "$n" ] && [ "$n" -ge "$BOSS_DISPATCH_MAX_APPLIES" ] 2>/dev/null; then
+    parts="open applies: $n (threshold $BOSS_DISPATCH_MAX_APPLIES)"
+  fi
+  free="$(free_mem_mb)"
+  if [ -n "$free" ] && [ "$free" -lt "$BOSS_DISPATCH_MIN_FREE_MB" ] 2>/dev/null; then
+    parts="${parts:+$parts; }free memory: ${free}MB below ${BOSS_DISPATCH_MIN_FREE_MB}MB"
+  fi
+  load="$(load_1min)"
+  if [ -n "$load" ] && awk -v l="$load" -v m="$BOSS_DISPATCH_MAX_LOAD" 'BEGIN { exit !(l >= m) }' 2>/dev/null; then
+    parts="${parts:+$parts; }1-min load: $load at or above $BOSS_DISPATCH_MAX_LOAD"
+  fi
+  [ -n "$parts" ] && printf 'resource warning: %s\n' "$parts"
+  return 0
 }
 
 # waiter_alive <pid> -- 0 when pid is a running boss-waiter. The script runs
