@@ -955,6 +955,14 @@ status_one() {
     dialog="$(herdr agent read "$pane_id" --source visible 2>/dev/null || true)"
   fi
 
+  local boss_wakeup boss boss_pane boss_reachable boss_name_ok boss_state
+  boss_wakeup="$(boss_wakeup_check "$workspace_id" "$(jq -r '.boss // empty' "$state_file")")"
+  boss="$(printf '%s' "$boss_wakeup" | jq -r '.boss // ""')"
+  boss_pane="$(printf '%s' "$boss_wakeup" | jq -r '.boss_pane // ""')"
+  boss_reachable="$(printf '%s' "$boss_wakeup" | jq -r '.boss_reachable')"
+  boss_name_ok="$(printf '%s' "$boss_wakeup" | jq -r '.boss_name_ok')"
+  boss_state="$(printf '%s' "$boss_wakeup" | jq -r '.state')"
+
   local lessons_global_json lessons_project_json gfile pfile
   lessons_global_json="[]"
   lessons_project_json="[]"
@@ -977,7 +985,9 @@ status_one() {
     --argjson diff_stat_range "$(printf '%s' "$diff_stat_range" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --arg summary "$summary" \
     --argjson lessons_global "$lessons_global_json" --argjson lessons_project "$lessons_project_json" \
-    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, pane: $pane, herdr_agent: $herdr_agent, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end)}')"
+    --arg boss "$boss" --arg boss_pane "$boss_pane" \
+    --argjson boss_reachable "$boss_reachable" --argjson boss_name_ok "$boss_name_ok" \
+    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, pane: $pane, herdr_agent: $herdr_agent, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end), boss: (if $boss == "" then null else $boss end), boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok}')"
 
   if [ "$json_only" -eq 1 ]; then
     printf '%s\n' "$json"
@@ -988,6 +998,11 @@ status_one() {
   printf 'project: %s\n' "$project"
   printf 'agent: %s (%s)\n' "$agent" "$agent_state"
   printf 'tab/pane: %s / %s (workspace %s)\n' "$tab_id" "$pane_id" "$workspace_id"
+  if [ "$boss_state" = "name_stale" ]; then
+    printf 'warning: workspace boss %s on pane %s lost its Herdr name; the waiter may not wake it (run boss claim there to heal it)\n' "${boss:-unknown}" "${boss_pane:-unknown}"
+  elif [ "$boss_state" = "not_reachable" ]; then
+    printf 'warning: workspace boss %s on pane %s is not reachable and no fallback boss was found\n' "${boss:-unknown}" "${boss_pane:-unknown}"
+  fi
   if [ "$(printf '%s' "$tasks_json" | jq -r '.missing')" = "true" ]; then
     printf 'tasks: missing (no tasks.md)\n'
   else
@@ -1211,6 +1226,19 @@ cmd_review() {
   line="$(review_locate "$change" "$project_name")" || exit 1
   IFS=$'\t' read -r project ev state_file <<<"$line"
 
+  local boss_workspace="" boss_dispatcher=""
+  if [ -n "$state_file" ] && [ -f "$state_file" ]; then
+    boss_workspace="$(jq -r '.workspace_id // empty' "$state_file")"
+    boss_dispatcher="$(jq -r '.boss // empty' "$state_file")"
+  fi
+  local boss_wakeup boss boss_pane boss_reachable boss_name_ok boss_state
+  boss_wakeup="$(boss_wakeup_check "$boss_workspace" "$boss_dispatcher")"
+  boss="$(printf '%s' "$boss_wakeup" | jq -r '.boss // ""')"
+  boss_pane="$(printf '%s' "$boss_wakeup" | jq -r '.boss_pane // ""')"
+  boss_reachable="$(printf '%s' "$boss_wakeup" | jq -r '.boss_reachable')"
+  boss_name_ok="$(printf '%s' "$boss_wakeup" | jq -r '.boss_name_ok')"
+  boss_state="$(printf '%s' "$boss_wakeup" | jq -r '.state')"
+
   local tasks_file tasks_open tasks_done tasks_total tasks_json
   tasks_file="$(tasks_file_for "$project" "$change")"
   if [ -n "$tasks_file" ]; then
@@ -1307,7 +1335,12 @@ cmd_review() {
     --argjson lessons_global "$lessons_global_json" --argjson lessons_project "$lessons_project_json" \
     --argjson retriggers "$retriggers" --argjson blocked_count "$blocked_count" \
     --argjson waiter_lost "$waiter_lost" --argjson duration_s "$duration_s" --arg note "$note" \
+    --arg boss "$boss" --arg boss_pane "$boss_pane" \
+    --argjson boss_reachable "$boss_reachable" --argjson boss_name_ok "$boss_name_ok" \
     '{change: $change, project: $project, summary: (if $summary == "" then null else $summary end),
+      boss: (if $boss == "" then null else $boss end),
+      boss_pane: (if $boss_pane == "" then null else $boss_pane end),
+      boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok,
       lessons: {global: $lessons_global, project: $lessons_project},
       quality: {tasks: $tasks, validate: $validate,
         tests: {result: $test_result, command: (if $test_cmd == "" then null else $test_cmd end)},
@@ -1325,6 +1358,11 @@ cmd_review() {
 
   printf 'change: %s\n' "$change"
   printf 'project: %s\n' "$project"
+  if [ "$boss_state" = "name_stale" ]; then
+    printf 'warning: workspace boss %s on pane %s lost its Herdr name; the waiter may not wake it (run boss claim there to heal it)\n' "${boss:-unknown}" "${boss_pane:-unknown}"
+  elif [ "$boss_state" = "not_reachable" ]; then
+    printf 'warning: workspace boss %s on pane %s is not reachable and no fallback boss was found\n' "${boss:-unknown}" "${boss_pane:-unknown}"
+  fi
   if [ "$(printf '%s' "$tasks_json" | jq -r '.missing')" = "true" ]; then
     printf 'tasks: missing (no tasks.md)\n'
   else

@@ -211,6 +211,15 @@ boss_agent_alive_pane() {
     'map(select(type == "object" and .pane_id == $p)) | length > 0' >/dev/null 2>&1
 }
 
+# boss_agent_name_on_pane <agents-json> <pane-id> -- the real Herdr name of the
+# agent on that pane, or empty when no agent sits there or it carries no name.
+# A pane can lose its name while still hosting the agent, so the pane id is the
+# only stable handle then.
+boss_agent_name_on_pane() {
+  printf '%s' "$1" | jq -r --arg p "$2" \
+    'map(select(type == "object" and .pane_id == $p)) | .[0].name // empty' 2>/dev/null || true
+}
+
 # boss_write_registry <file> <workspace-id> <pane-id> <agent> -- write the entry
 boss_write_registry() {
   local file="$1" workspace_id="$2" pane_id="$3" agent="$4"
@@ -281,7 +290,9 @@ boss_claim_pane() {
     reg_agent="$(jq -r '.agent // empty' "$reg" 2>/dev/null || true)"
     if [ -n "$reg_pane" ]; then
       if [ "$reg_pane" = "$pane_id" ]; then
-        if [ -n "$reg_agent" ] && [ "$name" != "$reg_agent" ]; then
+        # The registry compares wishes; the pane's real name is the reality.
+        # Heal a lost or renamed pane so the wake path works again.
+        if [ "$(boss_agent_name_on_pane "$agents" "$pane_id")" != "$name" ]; then
           herdr_json agent rename "$pane_id" "$name" >/dev/null || exit 1
           boss_write_registry "$reg" "$workspace_id" "$pane_id" "$name"
           reg_agent="$name"
@@ -310,12 +321,16 @@ boss_claim_pane() {
     '{workspace_id: $w, pane_id: $p, agent: $a, status: "claimed"}')"
 }
 
-# boss_resolve_agent <state-file> -- agent name of the boss responsible for an
-# apply, in this order: (1) the boss registered for the apply's workspace,
-# (2) the dispatcher boss recorded in the state, (3) the global BOSS_AGENT_NAME.
-# Dead entries are skipped; prints nothing when no boss is reachable.
+# boss_resolve_agent <state-file> -- ordered candidate list of targets for the
+# boss responsible for an apply, one target per line: (1) the boss registered
+# for the apply's workspace -- the real name of its living pane, or the pane id
+# when that pane lost its name, (2) the dispatcher boss recorded in the state,
+# (3) the global BOSS_AGENT_NAME. Dead entries are skipped and targets are
+# deduplicated. Prints nothing when no boss is reachable. Callers try the
+# candidates in order.
 boss_resolve_agent() {
-  local state_file="$1" agents ws reg reg_agent reg_pane state_boss
+  local state_file="$1" agents ws reg reg_agent reg_pane state_boss target
+  local -a candidates=()
   agents="$(boss_agents)"
   ws="$(jq -r '.workspace_id // empty' "$state_file" 2>/dev/null || true)"
   if [ -n "$ws" ]; then
@@ -323,21 +338,84 @@ boss_resolve_agent() {
     if [ -f "$reg" ]; then
       reg_agent="$(jq -r '.agent // empty' "$reg" 2>/dev/null || true)"
       reg_pane="$(jq -r '.pane_id // empty' "$reg" 2>/dev/null || true)"
-      if [ -n "$reg_agent" ] && boss_agent_alive_pane "$agents" "$reg_pane"; then
-        printf '%s' "$reg_agent"
-        return 0
+      if [ -n "$reg_pane" ] && boss_agent_alive_pane "$agents" "$reg_pane"; then
+        # The registry name is only a wish; the pane's real name (or its id)
+        # is what Herdr can address.
+        target="$(boss_agent_name_on_pane "$agents" "$reg_pane")"
+        [ -n "$target" ] || target="$reg_pane"
+        candidates+=("$target")
       fi
     fi
   fi
   state_boss="$(jq -r '.boss // empty' "$state_file" 2>/dev/null || true)"
   if [ -n "$state_boss" ] && boss_agent_alive_name "$agents" "$state_boss"; then
-    printf '%s' "$state_boss"
-    return 0
+    candidates+=("$state_boss")
   fi
   if [ -n "${BOSS_AGENT_NAME:-}" ] && boss_agent_alive_name "$agents" "$BOSS_AGENT_NAME"; then
-    printf '%s' "$BOSS_AGENT_NAME"
+    candidates+=("$BOSS_AGENT_NAME")
+  fi
+  # bash 3.2 (macOS /bin/bash) treats an empty array expansion under set -u
+  # as unbound, so leave early when there is no candidate.
+  [ "${#candidates[@]}" -gt 0 ] || return 0
+  local c
+  for c in "${candidates[@]}"; do
+    [ -n "$c" ] || continue
+    printf '%s\n' "$c"
+  done | awk '!seen[$0]++'
+}
+
+# boss_wakeup_check <workspace-id> [<dispatcher-name>] -- visible state of the
+# wake path for a workspace's apply, as compact JSON: 'state' is one of
+# ok/name_stale/not_reachable, 'boss' the registered name, 'boss_pane' the
+# registered pane, 'boss_reachable' true when any candidate (workspace boss,
+# dispatcher, global) is alive and 'boss_name_ok' false when the living boss
+# pane no longer carries the registered name. A missing workspace id, or an
+# unreachable Herdr, makes no claim: state 'ok' and boss_reachable true, so a
+# finished apply's review stays silent.
+boss_wakeup_check() {
+  local workspace_id="${1:-}" dispatcher="${2:-}"
+  local out agents reg reg_agent="" reg_pane="" real="" reachable=false name_ok=true state="ok"
+
+  out="$(herdr agent list 2>/dev/null || true)"
+  if ! printf '%s' "$out" | jq -e '(.result.agents // .agents) | type == "array"' >/dev/null 2>&1; then
+    jq -nc '{state: "ok", boss: null, boss_pane: null, boss_reachable: true, boss_name_ok: true}'
     return 0
   fi
+  agents="$(printf '%s' "$out" | jq -c '.result.agents // .agents // []')"
+
+  if [ -n "$workspace_id" ]; then
+    reg="$(boss_registry_file_for "$workspace_id")"
+    if [ -f "$reg" ]; then
+      reg_agent="$(jq -r '.agent // empty' "$reg" 2>/dev/null || true)"
+      reg_pane="$(jq -r '.pane_id // empty' "$reg" 2>/dev/null || true)"
+    fi
+    if [ -n "$reg_pane" ] && boss_agent_alive_pane "$agents" "$reg_pane"; then
+      reachable=true
+      real="$(boss_agent_name_on_pane "$agents" "$reg_pane")"
+      if [ -z "$reg_agent" ] || [ "$real" != "$reg_agent" ]; then
+        name_ok=false
+      fi
+    fi
+    # The fallback stages mirror boss_resolve_agent, so a reachable dispatcher
+    # or global boss is not reported as a broken wake path.
+    if [ "$reachable" != true ] && [ -n "$dispatcher" ] && boss_agent_alive_name "$agents" "$dispatcher"; then
+      reachable=true
+    fi
+    if [ "$reachable" != true ] && [ -n "${BOSS_AGENT_NAME:-}" ] && boss_agent_alive_name "$agents" "$BOSS_AGENT_NAME"; then
+      reachable=true
+    fi
+    if [ "$reachable" != true ]; then
+      state="not_reachable"
+    elif [ "$name_ok" != true ]; then
+      state="name_stale"
+    fi
+  fi
+
+  jq -nc --arg state "$state" --arg boss "$reg_agent" --arg pane "$reg_pane" \
+    --argjson reachable "$reachable" --argjson name_ok "$name_ok" \
+    '{state: $state, boss: (if $boss == "" then null else $boss end),
+      boss_pane: (if $pane == "" then null else $pane end),
+      boss_reachable: $reachable, boss_name_ok: $name_ok}'
 }
 
 # one_line <text> -- collapse newlines/tabs into single spaces, trim

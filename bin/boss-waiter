@@ -119,43 +119,53 @@ wait_for() {
   done
 }
 
-# deliver <text> <state> -- prompt the responsible boss agent; retry with
-# growing backoff while the boss is blocked; fall back to a notification when
-# no boss is reachable.
+# deliver <text> <state> -- prompt the responsible boss agent. The candidate
+# list (workspace boss, dispatcher, global) is tried in order: an
+# 'agent_not_found' moves on to the next candidate, while a blocked or
+# transient failure retries the same candidate with growing backoff until the
+# overall budget is spent. Only when no candidate could be reached is a Herdr
+# notification shown.
 deliver() {
   local text="$1" st="$2"
-  local boss attempt=1 backoff=15 start now out rc code
-  boss="$(boss_resolve_agent "$state_file")"
-  if [ -z "$boss" ]; then
+  local candidates candidate attempt backoff start now out rc code
+  candidates="$(boss_resolve_agent "$state_file")"
+  if [ -z "$candidates" ]; then
     log "no boss agent reachable (workspace/dispatcher/global); showing a notification instead"
     herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st" >/dev/null 2>&1 || true
     return 1
   fi
   start="$(date +%s)"
-  while true; do
-    out="$(herdr agent prompt "$boss" "$text" 2>&1)"
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-      log "prompt delivered to agent '$boss' (state=$st, attempt=$attempt)"
-      return 0
-    fi
-    code="$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null || true)"
-    if [ "$code" = "agent_not_found" ]; then
-      log "no boss agent '$boss'; showing a notification instead"
-      herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st" >/dev/null 2>&1 || true
-      return 1
-    fi
-    now="$(date +%s)"
-    if [ $(( now - start + backoff )) -gt "$BOSS_WAITER_MAX_S" ]; then
-      log "delivery retry budget exceeded (${BOSS_WAITER_MAX_S}s); giving up"
-      herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st (delivery failed)" >/dev/null 2>&1 || true
-      return 1
-    fi
-    log "delivery failed ($code); retrying in ${backoff}s"
-    sleep "$backoff"
-    attempt=$((attempt + 1))
-    backoff=$((backoff * 2))
-  done
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    attempt=1
+    backoff=15
+    while true; do
+      out="$(herdr agent prompt "$candidate" "$text" 2>&1)"
+      rc=$?
+      if [ "$rc" -eq 0 ]; then
+        log "prompt delivered to agent '$candidate' (state=$st, attempt=$attempt)"
+        return 0
+      fi
+      code="$(printf '%s' "$out" | jq -r '.error.code // "unknown"' 2>/dev/null || true)"
+      if [ "$code" = "agent_not_found" ]; then
+        log "candidate '$candidate' not found; trying the next candidate"
+        break
+      fi
+      now="$(date +%s)"
+      if [ $(( now - start + backoff )) -gt "$BOSS_WAITER_MAX_S" ]; then
+        log "delivery retry budget exceeded (${BOSS_WAITER_MAX_S}s); giving up"
+        herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st (delivery failed)" >/dev/null 2>&1 || true
+        return 1
+      fi
+      log "delivery to '$candidate' failed ($code); retrying in ${backoff}s"
+      sleep "$backoff"
+      attempt=$((attempt + 1))
+      backoff=$((backoff * 2))
+    done
+  done <<<"$candidates"
+  log "no boss candidate reachable (workspace/dispatcher/global); showing a notification instead"
+  herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st" >/dev/null 2>&1 || true
+  return 1
 }
 
 main() {
