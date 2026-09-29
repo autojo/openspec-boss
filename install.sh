@@ -135,14 +135,13 @@ check_prereqs() {
       missing=$((missing + 1))
     fi
   done
-  # The waiter is detached with setsid when available, otherwise with nohup
-  # (macOS has no setsid). At least one of them must exist.
+  # The waiter is detached with setsid when available, then nohup (macOS), and
+  # otherwise a plain background process; neither is a hard prerequisite.
   if ! command -v setsid >/dev/null 2>&1; then
     if command -v nohup >/dev/null 2>&1; then
       info "setsid not found; the waiter will be detached with nohup"
     else
-      fail "missing prerequisite: need 'setsid' or 'nohup' to detach the waiter"
-      missing=$((missing + 1))
+      warn "neither setsid nor nohup found; the waiter will fall back to a plain background process (run the container with an init)"
     fi
   fi
   if command -v python3 >/dev/null 2>&1; then

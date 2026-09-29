@@ -57,25 +57,37 @@ can be transferred to other servers.
 
 The boss never waits actively: every dispatch starts a detached waiter process
 that waits for the apply agent's state (`done`, `idle` or `blocked`) and
-writes the result into the boss session as a prompt. That makes waking work
-the same way in Claude Code and OpenCode.
+writes the result into the boss session as a prompt. The waiter verifies the
+prompt was accepted and records every wake as a durable inbox item, so a wake
+that is lost is recovered on a later one. That makes waking work the same way
+in Claude Code and OpenCode.
 
 The boss is scoped to its Herdr workspace: `boss claim` makes a pane the boss
 of its workspace, and `dispatch`/`retrigger`/`finish`/`answer` claim a free
 workspace automatically (or abort when another living pane owns it). Several
 workspaces can run their own boss in parallel. When an apply settles, the waiter
-resolves the responsible boss in this order: (1) the boss registered for the
-workspace the apply runs in, (2) the boss that dispatched the apply (stored in
-the state), (3) the global `BOSS_AGENT_NAME` (default `boss`). Dead agents are
-skipped; when none is reachable, the waiter shows a Herdr notification instead.
+resolves the responsible boss in this order: (1) the boss that dispatched the
+apply (stored in the state; by name, or by its recorded pane id when the name was
+lost), (2) the boss registered for the workspace the apply runs in, (3) the global
+`BOSS_AGENT_NAME` (default `boss`). Dead agents are skipped; when none is
+reachable, the waiter shows a Herdr notification instead. On the next wake the
+boss drains the durable inbox with `boss inbox`.
 
 ## Explorer and Executer
 
 The system has two named roles. The boss session is the **Explorer**: it owns
-the big task, plans, creates changes, dispatches work, reviews the result,
-maintains the skills and escalates to the human. An **Executer** is an apply
-agent (`apply-<change>`) and implements exactly one OpenSpec change in its own
-Herdr tab; the Explorer never works in that tab.
+the big task, plans, creates changes, dispatches work, reviews the result and
+maintains the skills. An **Executer** is an apply agent (`apply-<change>`) and
+implements exactly one OpenSpec change in its own Herdr tab; the Explorer never
+works in that tab.
+
+The Explorer runs without the human. It never waits: a blocked executer, three
+retriggers without progress (`BOSS_MAX_RETRIGGERS`, default 3), and a judgment
+question all become deterministic fallbacks – decide the conservative,
+reversible option, record it with `boss journal`, and continue. Questions that
+would change the assignment are settled before the run, in the mission charter.
+`boss doctor --project <p>` preflights the permissions and prerequisites of a
+run (read-only; `--fix` performs safe repairs only).
 
 One workspace runs at most one active Executer at a time: two changes would
 share the same working tree and index. `boss dispatch` checks the target
@@ -88,8 +100,9 @@ own Explorer and Executer in parallel. The command `boss` and the agent name
 ## Missions
 
 A large task that breaks into several changes is planned as a **mission**: a
-Markdown file in the target project with the goal in prose and the changes in
-execution order, one `- <change>` per line:
+Markdown file in the target project with a **charter** (goal, non-goals,
+constraints, authorization, stop conditions, open questions) and the change
+lists:
 
 ```markdown
 # Mission: crawl-expansion
@@ -98,28 +111,63 @@ execution order, one `- <change>` per line:
 
 Ship the crawler: first the worker, then the rate limit, at last the cleanup.
 
+## Authorization
+
+| Category | Decision | Bound |
+| --- | --- | --- |
+| Remote push | granted | own branch only |
+
+## Open Questions
+
+- [x] Which database?
+
 ## Changes
 
 - add-worker
 - fix-ratelimit
+
+## Backlog
+
 - archive-cleanup
 ```
 
+`## Authorization` is a table (category -> `granted`/`denied`/`bounded` plus a
+bound); `## Open Questions` is a `- [ ]`/`- [x]` checklist. Resolve every
+question and authorization row before the run: `boss mission next` returns
+`charter_open` and dispatches nothing while one is open. Questions that would
+change the assignment belong here, not in a mid-run prompt.
+
 `boss mission start <slug> --project <p>` writes this skeleton (never
 overwriting an existing file), `boss mission status <slug> --project <p>` shows
-the goal and each change with a derived state, and `boss mission next <slug>
---project <p>` starts the first change that is not yet `done` through the normal
-dispatch path. The file stores no status of its own: a change is `done` when it
-is `finished` (a `finish` event), has no open task and is `openspec validate`
-green; `change_not_ready` means no proposal exists yet, the signal for the
-Explorer to create it before the next tick. `next` returns `mission_complete`
-when every change is done, and `executer_busy` when the workspace already runs
-an Executer. The mission doc lives under the project, so it is visible and
-versioned with the plan – default `openspec/missions/<slug>.md`, override with
-`[missions] dir` (a leading `~` is expanded).
+the goal, the charter state, the planning mode and each change with a derived
+state, and `boss mission next <slug> --project <p>` gates on the charter and
+starts the first change that is not yet `done` through the normal dispatch path.
+The file stores no status of its own: a change is `done` when it is `finished`
+(a `finish` event), has no open task and is `openspec validate` green;
+`change_not_ready` names the missing artifact (`proposal` vs `specs`/`tasks`),
+the signal for the Explorer to create it before the next tick. `next` returns
+`mission_complete` when every change is done, and `executer_busy` when the
+workspace already runs an Executer. `boss mission add|rm <slug> <change>` edit
+the `## Changes` list. The mission doc lives under the project, so it is visible
+and versioned with the plan – default `openspec/missions/<slug>.md`, override
+with `[missions] dir` (a leading `~` is expanded). Only bullets under
+`## Changes`/`## Backlog` are read as changes and the goal only from
+`## Goal`/`## Brief`; a doc without those headings still parses as a plain change
+list.
 
-After each `boss finish` of a mission change the Explorer calls `boss mission
-next` for the next step; the order in the doc is the order of execution.
+**Planning mode** – `planning: planned | rolling | mixed` (default `planned`):
+`planned` writes every proposal up front and specs/tasks lazily per change;
+`rolling` plans only the next change and keeps the rest in `## Backlog`; `mixed`
+combines a planned prefix with a rolling tail.
+
+After each `boss finish` of a mission change the Explorer **reconciles** before
+the next dispatch: `reconcile: explore | quick` (default `explore`) – an explore
+pass that re-reads the result, reads the affected code, questions the remaining
+proposals and sharpens them, or a mechanical re-check. `boss reconcile <slug>
+--project <p> [--json]` assembles the context read-only (charter, remaining
+changes, backlog, open inbox items, journal tail). A broken charter assumption
+becomes a `[charter-assumption-broken]` journal entry and the run continues
+conservatively.
 
 ## Commands
 
@@ -128,6 +176,9 @@ boss dispatch <change> [--project <name|path>] [--runner <name>] [--note <text>]
 boss status [<change>] [--project <name|path>] [--json]
 boss review <change> [--project <name|path>] [--json]
 boss wait <change> [--project <name|path>]
+boss inbox [--project <name|path>] [--json] [--ack <id>]
+boss journal [--project <name|path>] [--change <change>] [--tag <tag>] <text>
+boss doctor [--project <name|path>] [--json] [--fix]
 boss retrigger <change> [--project <name|path>] [--note <text>]
 boss finish <change> [--project <name|path>] [--force] [--lesson <text>] [--lesson-scope project|global]
 boss answer <change> <key>... [--project <name|path>]
@@ -137,6 +188,8 @@ boss skills dir [--project <name|path>] [--json]
 boss mission start <slug> --project <name|path>
 boss mission status <slug> [--project <name|path>]
 boss mission next <slug> [--project <name|path>]
+boss mission add|rm <slug> <change> [--project <name|path>]
+boss reconcile <slug> [--project <name|path>] [--json]
 boss config-json
 ```
 
@@ -158,7 +211,8 @@ boss config-json
   carries everything Herdr knows about the agent: `agent_status` (alias of
   `agent_state`), `pane` (`pane_id`, `tab_id`, `workspace_id`, `cwd`,
   `focused`) and `herdr_agent` (the raw agent object, `null` when the agent is
-  gone), plus the stored `note` and the last agent output as `summary`.
+  gone), plus the stored `note`, the last agent output as `summary`, the waiter
+  state (`waiter_pid`/`waiter_alive`) and `inbox_pending` (open wake items).
 - `review` gathers the deterministic review facts for an apply: task counts,
   `openspec validate --strict`, a test command, the commits of the apply and
   the git working tree, the last agent output as `summary`, and the friction
@@ -171,7 +225,23 @@ boss config-json
   `finish`, when only the event log is left.
 - `wait` makes sure a waiter is armed for the apply (starts one if none is
   alive, otherwise reports the running one). Use it after prompting the apply
-  agent directly through Herdr.
+  agent directly through Herdr. `boss wait --all` re-arms every open apply whose
+  waiter died, for example after a restart.
+- `inbox` lists the durable wake items written by the waiters and, with
+  `--ack <id>`, drops one after it was handled. Items whose apply is already
+  finished are discarded while listing, so `boss inbox` stays empty between
+  runs. The boss drains it at the start of every wake to recover a lost wake;
+  the wake prompt ends with a `boss inbox` pointer.
+- `journal` appends a dated entry to the project's decision journal
+  (`openspec/journal.md` by default; `[journal] project` overrides the path).
+  The Explorer records every autonomous decision and every `grant gap`
+  (`--tag grant-gap`) there. The journal is never injected into a prompt.
+- `doctor` prints one preflight check per line (`status` `ok`/`warn`/`fail` plus
+  a `hint`) for a project: OpenSpec initialized for both tools, the Herdr
+  integration and the runner on `PATH`, a workspace, a test command, the
+  registry entry, write access and the boss session's permission scope. It never
+  blocks a run; `--fix` only creates directories, runs `openspec init` and adds
+  a missing registry entry.
 - `retrigger` sends the apply command (with the stored or a new `--note`) to
   the same agent again; the session context is kept and the waiter stays armed.
 - `finish` closes the apply tab, stops the waiter and drops the state. It
@@ -469,6 +539,34 @@ macOS in particular, where `~/.local/bin` is usually not in the default
    `boss.toml`. Use a workspace per project for independent bosses.
 3. Plan, dispatch, review changes – as described in the `boss` skill.
 
+## Container (Coder / slim images)
+
+boss runs unchanged inside a Linux container (for example a Coder workspace)
+when these are in place:
+
+- **Tools**: `herdr`, `openspec`, `jq`, `python3`, `git`, a SHA1 tool
+  (`sha1sum`, `shasum`, `openssl`; `python3` also hashes) and `ps` or `/proc`
+  for waiter liveness. `setsid`/`nohup` are optional; without both the waiter is
+  started as a plain background process. `boss doctor` reports all of this.
+- **PATH**: make `boss`, `herdr` and the runner reachable there. The
+  `--add-to-path` shell entry is for hosts; an image sets `ENV PATH=…` instead.
+- **Herdr and runner inside the container**: the model needs a Herdr server and
+  the agent CLI in the same container, or a Herdr socket reachable via
+  `HERDR_SOCKET_PATH`. Install the integrations once
+  (`herdr integration install claude` / `... opencode`).
+- **Persistent state**: mount `XDG_STATE_HOME` (default `~/.local/state`) as a
+  volume so applies, waiters and the inbox survive a restart; mount the config
+  (`XDG_CONFIG_HOME`/`~/.config/openspec-boss`) too. After a restart without a
+  volume, `boss wait --all` re-arms the waiters.
+- **PID 1**: run the container with an init (`docker run --init`, or tini) so
+  the detached waiter is reaped.
+- **Install once per environment**: `install.sh` creates symlinks with an
+  absolute repo target, so run it inside the container as well. The same clone
+  can serve both when it is mounted at the same path; otherwise clone per
+  environment.
+
+Nothing here changes a native install.
+
 ## Troubleshooting
 
 - **Waiter logs**: `~/.local/state/openspec-boss/logs/<change>-<time>.log`
@@ -493,13 +591,18 @@ macOS in particular, where `~/.local/bin` is usually not in the default
 - **Dispatch failed?** The tab is closed again and the error JSON carries the
   pane's last visible lines as `pane_tail`; set `BOSS_KEEP_FAILED_TAB=1` to
   keep the tab for inspection.
-- **No waking?** The waiter resolves the responsible boss via the workspace
-  registry, the recorded dispatcher boss and finally the global `BOSS_AGENT_NAME`
-  (default `boss`). Check `herdr agent list` for that name and that the Herdr
-  integration of the runner is installed (`herdr integration status`). An apply
-  that sits in its own wait loop stays `working` and is never a settled state,
-  so the waiter stays silent; the yield instruction prevents that, and
-  `BOSS_WAITER_STALL_MS` surfaces it.
+- **No waking?** The waiter resolves the responsible boss via the recorded
+  dispatcher boss, the workspace registry and finally the global
+  `BOSS_AGENT_NAME` (default `boss`). Check `herdr agent list` for that name and
+  that the Herdr integration of the runner is installed
+  (`herdr integration status`). An apply that sits in its own wait loop stays
+  `working` and is never a settled state, so the waiter stays silent; the yield
+  instruction prevents that, and `BOSS_WAITER_STALL_MS` surfaces it.
+- **Missed a wake?** Every wake is also a durable item under
+  `~/.local/state/openspec-boss/inbox/`; `boss inbox` lists it and
+  `boss status <change>` shows `inbox_pending`. A later wake drains earlier
+  ones. `boss wait --all` re-arms waiters that died, for example after a
+  restart.
 - **No boss reachable?** If none of the three candidates is alive, the waiter
   cannot prompt anyone: it shows a Herdr notification naming the apply instead.
   Claim a boss for the apply's workspace (`boss claim`) or start a global

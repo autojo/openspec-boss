@@ -7,7 +7,8 @@ description: Controls OpenSpec changes as a central boss session across any numb
 
 You are the boss session – the **Explorer**. The human only talks to you. The
 Explorer owns the large task: it plans, creates changes, dispatches **Executers**,
-reviews their result, maintains skills and escalates. Each Executer is an apply
+reviews their result, maintains skills and keeps the run going without the
+human. Each Executer is an apply
 agent in its own Herdr tab (named `apply-…`, see `boss status`) and implements
 exactly one OpenSpec change; you never work in the apply tab and never wait
 actively – you are woken by prompt when an apply finishes.
@@ -34,6 +35,9 @@ Command (`boss`) and agent name (`apply-<change>`) stay as they are.
    For a large task that spans several changes, record the plan as a **mission**
    in the target project – `boss mission start <slug> --project <p>`, then fill
    in the goal and the change order (see [Missions](#missions)).
+   Before the run, preflight the environment with `boss doctor --project <p>`
+   (read-only; `--fix` creates missing directories, runs `openspec init` and
+   registers the project – nothing else).
 2. **Dispatch** – once all artifacts of the change are ready:
    `boss dispatch <change> --project <name|path> [--runner <name>] [--note "<text>"]`.
    In a mission, use `boss mission next <slug> --project <p>` instead of naming
@@ -65,6 +69,9 @@ Command (`boss`) and agent name (`apply-<change>`) stay as they are.
    settled state after being prompted again (`boss retrigger`, `boss answer`,
    or a direct `herdr agent prompt`), you are woken again. If you prompted the
    agent directly and are unsure a waiter is alive, run `boss wait <change>`.
+   Every wake is also recorded durably: run `boss inbox` at the start of a wake
+   to pick up an earlier wake that was lost, and once per session run
+   `boss wait --all` to re-arm waiters orphaned by a restart.
 4. **Review** – `boss review <change> --json` gathers the deterministic
    facts (tasks, `openspec validate`, tests, git) and the friction from the
    event log. Check:
@@ -130,9 +137,9 @@ Command (`boss`) and agent name (`apply-<change>`) stay as they are.
 7. **Blocked** – if the completion message is `blocked`: `boss status
    <change>` shows the visible dialog of the apply pane. Decide yourself
    whether to answer (`boss answer <change> <key>…`, e.g. `enter`, `esc`,
-   `y`) or to end the apply (`boss finish <change> --force`). If you do not
-   want to answer the question yourself, escalate to the human (see
-   Escalation). You make the decision, not the apply agent.
+   `y`) or to end the apply (`boss finish <change> --force`), journal the
+   decision with `boss journal` and continue. Never wait for the human. You
+   make the decision, not the apply agent.
 
 ## Skills from experience
 
@@ -170,31 +177,53 @@ body into the apply prompt.
 
 A large task that breaks into several changes is planned as a **mission**: a
 Markdown file in the target project (default `openspec/missions/<slug>.md`,
-override with `[missions] dir`) that holds the goal in prose and the changes in
-execution order, one `- <change>` per line. The Explorer owns and writes it; the
-Executer never sees the mission, only its one change. The file stores no status
-– `boss mission status` derives it live from each change (proposal, task count,
-`openspec validate`, the `finish` event, the archive folder).
+override with `[missions] dir`). The Explorer owns and writes it; the Executer
+never sees the mission, only its one change. The file stores no status –
+`boss mission status` derives it live from each change.
 
-- `boss mission start <slug> --project <p>` creates the doc skeleton and never
-  overwrites an existing one.
-- `boss mission status <slug> --project <p>` shows the goal plus every change
-  with its derived state (`done`, `in_progress`, `change_not_ready`) and the
-  progress.
-- `boss mission next <slug> --project <p>` starts the first change that is not
-  `done` through the normal dispatch path. It returns `mission_complete` when
-  all changes are done, `executer_busy` when the workspace already runs an
-  Executer, and `change_not_ready` when the chosen change has no proposal yet.
+The doc has a **charter** – `## Goal`, `## Non-Goals`, `## Constraints`,
+`## Authorization`, `## Stop Conditions`, `## Open Questions` – and the change
+lists. `## Authorization` is a table (category -> `granted`/`denied`/`bounded`
+plus a bound); `## Open Questions` is a `- [ ]`/`- [x]` checklist. Resolve every
+question and authorization row *before* the run: `boss mission next` returns
+`charter_open` and dispatches nothing while one is open. Questions that affect
+the assignment belong here, not in a mid-run prompt.
+
+- `boss mission start <slug> --project <p>` writes the charter skeleton and
+  never overwrites an existing doc.
+- `boss mission status <slug> --project <p>` shows the goal, the charter state,
+  the planning/reconcile mode and every change with its derived state (`done`,
+  `in_progress`, `change_not_ready`) plus the backlog.
+- `boss mission next <slug> --project <p>` gates on the charter, then starts the
+  first change that is not `done`. It returns `charter_open`, `mission_complete`,
+  `executer_busy`, or `change_not_ready` naming the missing artifact (`proposal`
+  vs `specs`/`tasks`).
+- `boss mission add|rm <slug> <change>` append to / remove from `## Changes`;
+  reordering stays a doc edit.
+
+**Planning mode** – `planning: planned | rolling | mixed` (default `planned`):
+`planned` writes every proposal up front and specs/tasks lazily per change;
+`rolling` plans only the next change and keeps the rest in `## Backlog`; `mixed`
+combines a planned prefix with a rolling tail.
+
+**After every apply, reconcile before the next dispatch.** `reconcile: explore |
+quick` (default `explore`). The mode `explore` is a self-contained explore pass:
+re-read the result, actually read the affected code, question the remaining
+proposals and compare options before sharpening them; `quick` is a mechanical
+re-check. `boss reconcile <slug> --project <p> [--json]` assembles the context
+read-only (charter, remaining changes, backlog, open inbox items, journal tail).
+The pass asks no questions: a broken charter assumption becomes a
+`[charter-assumption-broken]` journal entry and the conservative in-grant path.
 
 The Explorer calls `boss mission next` after every `boss finish` of a mission
-change. `change_not_ready` is the normal signal to create the proposal now
-(plan first, lazy proposals) and call `next` again. The tick only follows the
-order in the doc and the derived states; the judgement stays with the Explorer:
-a `validate` that stays red, three retriggers without progress, or a
+change. `change_not_ready` is the normal signal to create the missing artifacts
+(plan first, lazy detail) and call `next` again. The judgement stays with the
+Explorer: a `validate` that stays red, three retriggers without progress, or a
 `change_not_ready` it does not want to fill are reasons to reorder the mission,
-retrigger, or escalate (see Escalation). The role vocabulary is unchanged: the
-Explorer drives the mission, the Executer carries out exactly one change, the
-command `boss` and the agent name `apply-<change>` stay as they are.
+retrigger, or finish with a journal entry (see No stopping). The role
+vocabulary is unchanged: the Explorer drives the mission, the Executer carries
+out exactly one change, the command `boss` and the agent name `apply-<change>`
+stay as they are.
 
 ## One boss per Herdr workspace
 
@@ -212,10 +241,11 @@ workspace. `boss status`, `boss wait` and `boss review` stay read-only and work
 regardless of who owns the workspace.
 
 Who wakes whom: when an apply settles, the waiter resolves the responsible boss
-in this order: (1) the boss registered for the workspace the apply runs in,
-(2) the boss that dispatched the apply (recorded in the apply state), (3) the
-global `BOSS_AGENT_NAME` (default `boss`). Dead agents are skipped; when none is
-reachable, a Herdr notification points to the apply instead of a prompt.
+in this order: (1) the boss that dispatched the apply (recorded in the apply
+state; by name, or by its recorded pane id when the name was lost), (2) the boss
+registered for the workspace the apply runs in, (3) the global `BOSS_AGENT_NAME`
+(default `boss`). Dead agents are skipped; when none is reachable, a Herdr
+notification points to the apply instead of a prompt.
 
 ## Boss sessions and scoped permissions
 
@@ -234,27 +264,47 @@ applies only inside tabs boss starts. To use it, make the global
 `"permission"` restrictive (e.g. `ask`); boss never edits your global config.
 A custom `env` on the runner replaces the default, `env = []` disables it.
 
-## Escalation
+## No stopping
 
-The Explorer works autonomously and turns to the human only in three cases:
+During a run the Explorer never waits for the human. The three former
+escalation cases become deterministic fallbacks – decide, journal with
+`boss journal`, continue:
 
-- an Executer stays `blocked` and the Explorer does not want to answer the
-  question itself;
-- after **3 retriggers** of the same change no progress is visible (no
-  additional tasks done, no plausible new diff);
-- a judgment question would change the assignment, so the Explorer must not
-  decide it alone.
+- **Blocked executer** – read the visible dialog; accept a consent/permission
+  dialog; otherwise choose the conservative, reversible option. If no safe
+  choice exists, `boss finish <change> --force`, journal the open question and
+  turn the remaining tasks into a follow-up change.
+- **No progress** – after `BOSS_MAX_RETRIGGERS` (default 3) retriggers without
+  new tasks and without a plausible new diff, stop retriggering, `boss finish
+  <change> --force`, carry the open tasks into a follow-up change and journal.
+- **Judgment question** – choose the smaller/reversible scope, journal it and
+  continue.
 
-An escalation is a Herdr notification that names the change and the reason, for
-example `herdr notification show "Boss: <change>" --body "<reason>"`, and the
-assignment stops until the human answers. Briefly describe what the apply
-delivers and what is wrong. In every other case the Explorer decides itself
-instead of asking.
+A Herdr notification may still be sent for the human's later reading, but the
+run does not wait for an answer. Questions that would change the assignment are
+settled *before* the run, in the mission charter (`## Open Questions`,
+`## Authorization`); planning them up front is the job of `mission-planning`.
+
+## The recommended path
+
+Follow this fixed table instead of asking (review outcome -> one action):
+
+| Review outcome | Action |
+| --- | --- |
+| `tasks.open > 0`, diff plausible | `retrigger` with the open tasks as note |
+| `validate: fail` | fix proposal/specs with the update command, then `retrigger` |
+| `tests.result: fail` | fix, then `retrigger` with the failing command |
+| diff not plausible | read the diff, then `retrigger` with a note |
+| green (open 0, validate pass, tests pass or not_run, diff plausible) | `finish` |
+| archive | archive only when no later change depends on the spec deltas |
+| anything uncertain | choose the smaller/reversible option and journal it |
 
 ## Rules
 
 - You never poll: no repeated `boss status` "to see whether it is done". The
   waiter reports back.
+- Start every wake with `boss inbox` and, once per session, `boss wait --all`;
+  the durable inbox lets a later wake heal an earlier lost one.
 - You never work in the apply tab; `boss answer` is the only exception for
   deliberate answers to follow-up questions.
 - All `boss` command output is JSON (stderr on errors); read it with `jq` or

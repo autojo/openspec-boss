@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # boss -- single control session for OpenSpec apply cycles across projects.
-# Subcommands: dispatch, status, review, retrigger, finish, answer, config-json.
+# Subcommands: dispatch, status, review, wait, retrigger, finish, answer,
+# inbox, journal, doctor, config-json.
 
 set -u
 
@@ -32,6 +33,9 @@ Usage:
   boss review <change> [--project <name|path>] [--json]
   boss wait <change> [--project <name|path>]
   boss wait --all
+  boss inbox [--project <name|path>] [--json] [--ack <id>]
+  boss journal [--project <name|path>] [--change <change>] [--tag <tag>] <text>
+  boss doctor [--project <name|path>] [--json] [--fix]
   boss retrigger <change> [--project <name|path>] [--note <text>]
   boss finish <change> [--project <name|path>] [--force] [--lesson <text>] [--lesson-scope project|global]
   boss answer <change> <key>... [--project <name|path>]
@@ -41,6 +45,8 @@ Usage:
   boss mission start <slug> --project <name|path>
   boss mission status <slug> [--project <name|path>]
   boss mission next <slug> [--project <name|path>]
+  boss mission add|rm <slug> <change> [--project <name|path>]
+  boss reconcile <slug> [--project <name|path>] [--json]
   boss config-json
   boss --help
 EOF
@@ -195,6 +201,21 @@ lessons_project_path() {
   cfg="$(config_json)" || return 1
   path="$(printf '%s' "$cfg" | jq -r '.lessons.project // empty')"
   [ -n "$path" ] || path="openspec/lessons.md"
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    "~"|"~/"*) expand_home "$path" ;;
+    *) printf '%s/%s\n' "$project" "$path" ;;
+  esac
+}
+
+# journal_project_path <project> -- path of the project's decision journal:
+# '[journal] project' relative to the project root, or the default
+# openspec/journal.md. An absolute or ~ path is used as is.
+journal_project_path() {
+  local project="$1" cfg path
+  cfg="$(config_json)" || return 1
+  path="$(printf '%s' "$cfg" | jq -r '.journal.project // empty')"
+  [ -n "$path" ] || path="openspec/journal.md"
   case "$path" in
     /*) printf '%s\n' "$path" ;;
     "~"|"~/"*) expand_home "$path" ;;
@@ -721,9 +742,11 @@ cmd_dispatch() {
 dispatch_change() {
   local change="$1" project="$2" runner="$3" note="$4"
   # The dispatcher boss is recorded in the apply state so the waiter can wake
-  # it even when the apply runs in a different workspace.
-  local dispatcher_boss
+  # it even when the apply runs in a different workspace. Its pane id is kept
+  # too, so a boss that lost its Herdr name stays reachable.
+  local dispatcher_boss dispatcher_pane
   dispatcher_boss="$(boss_agent_name "${HERDR_WORKSPACE_ID:-}")"
+  dispatcher_pane="${HERDR_PANE_ID:-}"
 
   check_apply_ready "$project" "$change"
   local agent_name
@@ -841,9 +864,10 @@ dispatch_change() {
     --arg change "$change" --arg project "$project" --arg runner "$runner_name_out" \
     --arg kind "$kind" --arg apply_cmd "$apply_cmd" --arg note "$note" --arg lessons "$lessons_block" --arg yield "$runner_yield" --arg agent "$agent_name" \
     --arg pane_id "$pane_id" --arg tab_id "$tab_id" --arg workspace_id "$workspace_id" --arg boss "$dispatcher_boss" \
+    --arg boss_pane "$dispatcher_pane" \
     --arg base_head "$base_head" \
     --arg started_at "$now" --arg last_state "working" --arg last_state_at "$now" \
-    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, boss: $boss, base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at}' \
+    '{change: $change, project: $project, runner: $runner, kind: $kind, apply_cmd: $apply_cmd, note: $note, lessons: $lessons, yield: $yield, agent: $agent, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, boss: $boss, boss_pane: (if $boss_pane == "" then null else $boss_pane end), base_head: (if $base_head == "" then null else $base_head end), waiter_pid: null, started_at: $started_at, last_state: $last_state, last_state_at: $last_state_at}' \
     >"$state_file" || die_json "state_write" "cannot write state file $state_file"
 
   detach_waiter "$state_file"
@@ -960,6 +984,9 @@ status_one() {
   summary="$(jq -r '.summary // empty' "$state_file")"
   [ -n "$summary" ] || summary="$(last_event_field "$(events_file_for "$project" "$change")" summary summary)"
 
+  local inbox_pending
+  inbox_pending="$(inbox_count "$project" "$change")"
+
   local dialog=""
   if [ "$agent_state" = "blocked" ]; then
     dialog="$(herdr agent read "$pane_id" --source visible 2>/dev/null || true)"
@@ -989,6 +1016,7 @@ status_one() {
     --argjson tasks "$tasks_json" --arg dialog "$dialog" \
     --argjson herdr_agent "$herdr_agent" --argjson pane "$pane_json" --arg note "$(jq -r '.note // ""' "$state_file")" \
     --arg waiter_pid "$waiter_pid" --argjson waiter_alive "$waiter_alive_flag" \
+    --argjson inbox_pending "$inbox_pending" \
     --argjson changed_files "$(printf '%s' "$changed_files" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --argjson diff_stat "$(printf '%s' "$diff_stat" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     --arg base_head "$base_head" \
@@ -998,7 +1026,7 @@ status_one() {
     --argjson lessons_global "$lessons_global_json" --argjson lessons_project "$lessons_project_json" \
     --arg boss "$boss" --arg boss_pane "$boss_pane" \
     --argjson boss_reachable "$boss_reachable" --argjson boss_name_ok "$boss_name_ok" \
-    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, pane: $pane, herdr_agent: $herdr_agent, waiter_pid: (if $waiter_pid == "" then null else ($waiter_pid | tonumber? // $waiter_pid) end), waiter_alive: $waiter_alive, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end), boss: (if $boss == "" then null else $boss end), boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok}')"
+    '{change: $change, project: $project, agent: $agent, agent_state: $agent_state, agent_status: $agent_state, pane_id: $pane_id, tab_id: $tab_id, workspace_id: $workspace_id, pane: $pane, herdr_agent: $herdr_agent, waiter_pid: (if $waiter_pid == "" then null else ($waiter_pid | tonumber? // $waiter_pid) end), waiter_alive: $waiter_alive, inbox_pending: $inbox_pending, note: (if $note == "" then null else $note end), summary: (if $summary == "" then null else $summary end), last_state: $last_state, last_state_at: $last_state_at, tasks: $tasks, lessons: {global: $lessons_global, project: $lessons_project}, git: {base_head: (if $base_head == "" then null else $base_head end), commits: $commits, diff_stat_range: $diff_stat_range, changed_files: $changed_files, diff_stat: $diff_stat}, blocked_dialog: (if $dialog == "" then null else $dialog end), boss: (if $boss == "" then null else $boss end), boss_pane: (if $boss_pane == "" then null else $boss_pane end), boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok}')"
 
   if [ "$json_only" -eq 1 ]; then
     printf '%s\n' "$json"
@@ -1013,6 +1041,9 @@ status_one() {
     printf 'waiter: alive (pid %s)\n' "$waiter_pid"
   else
     printf 'waiter: DEAD -- boss wait %s\n' "$change"
+  fi
+  if [ "$inbox_pending" -gt 0 ]; then
+    printf 'inbox: %s pending -- boss inbox\n' "$inbox_pending"
   fi
   if [ "$boss_state" = "name_stale" ]; then
     printf 'warning: workspace boss %s on pane %s lost its Herdr name; the waiter may not wake it (run boss claim there to heal it)\n' "${boss:-unknown}" "${boss_pane:-unknown}"
@@ -1052,7 +1083,7 @@ status_one() {
 
 status_all() {
   local json_only="$1"
-  local files state_file agent agent_state waiter_pid waiter_alive_flag e json="[]" idx
+  local files state_file agent agent_state waiter_pid waiter_alive_flag inbox_pending e json="[]" idx
   files="$(ls "$BOSS_APPLIES_DIR"/*.json 2>/dev/null || true)"
   if [ "$json_only" -eq 0 ] && [ -z "$files" ]; then
     printf 'no applies recorded\n'
@@ -1065,14 +1096,18 @@ status_all() {
     waiter_pid="$(jq -r '.waiter_pid // empty' "$state_file")"
     waiter_alive_flag=false
     waiter_alive "$waiter_pid" && waiter_alive_flag=true
-    e="$(jq -c --arg s "$agent_state" --argjson wa "$waiter_alive_flag" \
-      '. + {agent_state: $s, waiter_alive: $wa, waiter_pid: (.waiter_pid // null)} | {change, project, agent, agent_state, waiter_pid, waiter_alive, pane_id, tab_id, workspace_id, last_state, last_state_at}' "$state_file")"
+    inbox_pending="$(inbox_count "$(jq -r '.project' "$state_file")" "$(jq -r '.change' "$state_file")")"
+    e="$(jq -c --arg s "$agent_state" --argjson wa "$waiter_alive_flag" --argjson ip "$inbox_pending" \
+      '. + {agent_state: $s, waiter_alive: $wa, inbox_pending: $ip, waiter_pid: (.waiter_pid // null)} | {change, project, agent, agent_state, waiter_pid, waiter_alive, inbox_pending, pane_id, tab_id, workspace_id, last_state, last_state_at}' "$state_file")"
     json="$(printf '%s' "$json" | jq -c --argjson e "$e" '. + [$e]')"
     if [ "$json_only" -eq 0 ]; then
       if [ "$waiter_alive_flag" = true ]; then
         printf '%s) %s in %s: %s (%s), waiter: alive (pid %s)\n' "$idx" "$(jq -r '.change' "$state_file")" "$(jq -r '.project' "$state_file")" "$agent" "$agent_state" "$waiter_pid"
       else
         printf '%s) %s in %s: %s (%s), waiter: DEAD\n' "$idx" "$(jq -r '.change' "$state_file")" "$(jq -r '.project' "$state_file")" "$agent" "$agent_state"
+      fi
+      if [ "$inbox_pending" -gt 0 ]; then
+        printf '   inbox: %s pending -- boss inbox\n' "$inbox_pending"
       fi
     fi
   done
@@ -1321,6 +1356,9 @@ cmd_review() {
   fi
   [ -n "$summary" ] || summary="$(last_event_field "$ev" summary summary)"
 
+  local inbox_pending
+  inbox_pending="$(inbox_count "$project" "$change")"
+
   local retriggers blocked_count waiter_lost duration_s note started_at started_epoch
   retriggers="$(event_count_since_dispatch "$ev" retrigger)"
   blocked_count="$(event_count_since_dispatch "$ev" blocked)"
@@ -1359,12 +1397,14 @@ cmd_review() {
     --argjson lessons_global "$lessons_global_json" --argjson lessons_project "$lessons_project_json" \
     --argjson retriggers "$retriggers" --argjson blocked_count "$blocked_count" \
     --argjson waiter_lost "$waiter_lost" --argjson duration_s "$duration_s" --arg note "$note" \
+    --argjson inbox_pending "$inbox_pending" \
     --arg boss "$boss" --arg boss_pane "$boss_pane" \
     --argjson boss_reachable "$boss_reachable" --argjson boss_name_ok "$boss_name_ok" \
     '{change: $change, project: $project, summary: (if $summary == "" then null else $summary end),
       boss: (if $boss == "" then null else $boss end),
       boss_pane: (if $boss_pane == "" then null else $boss_pane end),
       boss_reachable: $boss_reachable, boss_name_ok: $boss_name_ok,
+      inbox_pending: $inbox_pending,
       lessons: {global: $lessons_global, project: $lessons_project},
       quality: {tasks: $tasks, validate: $validate,
         tests: {result: $test_result, command: (if $test_cmd == "" then null else $test_cmd end)},
@@ -1391,6 +1431,9 @@ cmd_review() {
     printf 'tasks: missing (no tasks.md)\n'
   else
     printf 'tasks: %s open, %s done\n' "$(printf '%s' "$tasks_json" | jq -r '.open')" "$(printf '%s' "$tasks_json" | jq -r '.done')"
+  fi
+  if [ "$inbox_pending" -gt 0 ]; then
+    printf 'inbox: %s pending -- boss inbox\n' "$inbox_pending"
   fi
   printf 'validate: %s\n' "$validate_result"
   if [ -n "$test_cmd" ]; then
@@ -1506,6 +1549,318 @@ cmd_wait_all() {
       '. + [{change: $change, agent: $agent, waiter_pid: (if $pid == "" then null else ($pid | tonumber? // $pid) end), status: $status}]')"
   done
   printf '%s\n' "$json"
+}
+
+# ------------------------------------------------------------------ inbox ---
+
+# cmd_inbox [--project <name|path>] [--json] [--ack <id>] -- list the durable
+# wake items and, with --ack, drop one. Items whose apply state file is gone
+# are dropped while listing, so a finished apply leaves nothing behind.
+cmd_inbox() {
+  ensure_config
+  local project_name="" want_json=0 ack="" arg
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --project) project_name="${1:-}"; shift ;;
+      --json) want_json=1 ;;
+      --ack) ack="${1:-}"; shift ;;
+      -h|--help) usage ;;
+      --*) usage_error "unknown option: $arg" ;;
+      *) usage_error "unexpected argument: $arg" ;;
+    esac
+  done
+
+  local acked="null"
+  if [ -n "$ack" ]; then
+    local ack_path
+    ack_path="$(inbox_item_path "$ack")" || usage_error "invalid inbox id: $ack"
+    if [ -f "$ack_path" ]; then
+      rm -f "$ack_path"
+      acked=true
+    else
+      acked=false
+    fi
+  fi
+
+  local filter_project=""
+  if [ -n "$project_name" ]; then
+    filter_project="$(resolve_project "$project_name")" || exit 1
+  fi
+
+  local json="[]" f item change project
+  for f in "$BOSS_INBOX_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    change="$(jq -r '.change // empty' "$f" 2>/dev/null || true)"
+    project="$(jq -r '.project // empty' "$f" 2>/dev/null || true)"
+    if [ -z "$change" ] || [ -z "$project" ]; then
+      rm -f "$f"
+      continue
+    fi
+    # Drop an item whose apply is gone (finished).
+    if [ ! -f "$(state_file_for "$project" "$change")" ]; then
+      rm -f "$f"
+      continue
+    fi
+    if [ -n "$filter_project" ] && [ "$project" != "$filter_project" ]; then
+      continue
+    fi
+    item="$(jq -c '{id, ts, change, project, state, summary_at}' "$f" 2>/dev/null || true)"
+    [ -n "$item" ] && json="$(printf '%s' "$json" | jq -c --argjson i "$item" '. + [$i]')"
+  done
+
+  if [ "$want_json" -eq 1 ]; then
+    jq -nc --argjson items "$json" --argjson ack "$acked" \
+      '{ack: $ack, pending: ($items | length), items: $items}'
+    return 0
+  fi
+  if [ "$(printf '%s' "$json" | jq 'length')" -eq 0 ]; then
+    printf 'inbox empty\n'
+  else
+    printf '%s' "$json" | jq -r '.[] | "\(.change) in \(.project): \(.state) (\(.ts)) -- boss status \(.change)"'
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- journal ---
+
+# cmd_journal [--project <name|path>] [--change <change>] [--tag <tag>] <text>
+# -- append a dated entry to the project's decision journal. The journal is
+# read by the human, never injected into an apply prompt.
+cmd_journal() {
+  ensure_config
+  local project_name="" change="" tag="" text="" arg
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --project) project_name="${1:-}"; shift ;;
+      --change) change="${1:-}"; shift ;;
+      --tag) tag="$(normalize_name "${1:-}")"; shift ;;
+      -h|--help) usage ;;
+      --*) usage_error "unknown option: $arg" ;;
+      *) if [ -z "$text" ]; then text="$arg"; else text="$text $arg"; fi ;;
+    esac
+  done
+  [ -n "$text" ] || usage_error "usage: boss journal [--project <name|path>] [--change <change>] [--tag <tag>] <text>"
+
+  local project file clean
+  project="$(resolve_project "$project_name")" || exit 1
+  file="$(journal_project_path "$project")" || die_json "journal_path" "cannot resolve the journal path for $project"
+  clean="$(one_line "$text")"
+  journal_append "$file" "$clean" "$tag" \
+    || die_json "journal_write" "cannot write the journal $file"
+
+  printf '%s\n' "$(jq -n \
+    --arg project "$project" --arg path "$file" --arg change "$change" --arg tag "$tag" \
+    --arg text "$clean" --arg at "$(now_iso)" \
+    '{project: $project, path: $path, change: (if $change == "" then null else $change end),
+      tag: (if $tag == "" then null else $tag end), text: $text, at: $at, status: "journaled"}')"
+}
+
+# ----------------------------------------------------------------- doctor ---
+
+# doctor_check_json <id> <status> <hint> -- one doctor check as compact JSON.
+doctor_check_json() {
+  jq -nc --arg id "$1" --arg s "$2" --arg h "$3" \
+    '{id: $id, status: $s, hint: (if $h == "" then null else $h end)}'
+}
+
+# doctor_add <id> <status> <hint> -- append one check to $DOCTOR_TMP.
+doctor_add() {
+  doctor_check_json "$1" "$2" "$3" >>"${DOCTOR_TMP:-/dev/null}"
+}
+
+# doctor_register_project <project> <name> -- add '[projects] name = "path"'
+# to $BOSS_CONFIG when the project is not registered yet. Additive and safe;
+# returns 0 when already present or written, 1 when it cannot (name taken).
+doctor_register_project() {
+  local project="$1" name="$2" cfg tmp
+  is_project_registered "$project" && return 0
+  cfg="$(config_json 2>/dev/null || true)"
+  if printf '%s' "$cfg" | jq -e --arg n "$name" '.projects // {} | has($n)' >/dev/null 2>&1; then
+    return 1
+  fi
+  [ -f "$BOSS_CONFIG" ] || return 1
+  tmp="$(mktemp "${BOSS_CONFIG}.XXXXXX" 2>/dev/null)" || return 1
+  if awk -v name="$name" -v path="$project" '
+      BEGIN { in_projects = 0; inserted = 0 }
+      /^\[projects\][[:space:]]*$/ { in_projects = 1; print; printf "%s = \"%s\"\n", name, path; inserted = 1; next }
+      /^\[/ { if (in_projects) in_projects = 0 }
+      { print }
+      END { if (!inserted) printf "\n[projects]\n%s = \"%s\"\n", name, path }
+    ' "$BOSS_CONFIG" >"$tmp"; then
+    mv "$tmp" "$BOSS_CONFIG" || { rm -f "$tmp"; return 1; }
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# cmd_doctor [--project <name|path>] [--json] [--fix] -- preflight the
+# permissions and prerequisites of a run. Read-only by default; --fix performs
+# only safe, reversible repairs. Never blocks: it reports, and exits 0.
+cmd_doctor() {
+  ensure_config
+  local project_name="" want_json=0 fix=0 arg
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --project) project_name="${1:-}"; shift ;;
+      --json) want_json=1 ;;
+      --fix) fix=1 ;;
+      -h|--help) usage ;;
+      --*) usage_error "unknown option: $arg" ;;
+      *) usage_error "unexpected argument: $arg" ;;
+    esac
+  done
+
+  local project
+  project="$(resolve_project "$project_name")" || exit 1
+
+  DOCTOR_TMP="$(mktemp)" || die_json "state_write" "cannot create a temporary file"
+  local cfg kinds k iname default_runner
+
+  if command -v openspec >/dev/null 2>&1; then
+    doctor_add openspec_cli ok ""
+  else
+    doctor_add openspec_cli fail "install OpenSpec ('openspec') and put it on PATH"
+  fi
+
+  local have_herdr=0
+  if command -v herdr >/dev/null 2>&1; then
+    have_herdr=1
+    doctor_add herdr_cli ok ""
+  else
+    doctor_add herdr_cli fail "install Herdr and put 'herdr' on PATH"
+  fi
+
+  # dependencies: the tools a run needs, each satisfied by any alternative.
+  local dep_missing=""
+  if ! { command -v sha1sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 \
+         || command -v python3 >/dev/null 2>&1 || command -v openssl >/dev/null 2>&1; }; then
+    dep_missing="$dep_missing sha1"
+  fi
+  if ! command -v ps >/dev/null 2>&1 && [ ! -r /proc/self/cmdline ]; then
+    dep_missing="$dep_missing ps"
+  fi
+  command -v jq >/dev/null 2>&1 || dep_missing="$dep_missing jq"
+  command -v python3 >/dev/null 2>&1 || dep_missing="$dep_missing python3"
+  if [ -z "$dep_missing" ]; then
+    doctor_add dependencies ok ""
+  else
+    doctor_add dependencies fail "install:$dep_missing"
+  fi
+
+  cfg="$(config_json 2>/dev/null || true)"
+  kinds="$(printf '%s' "$cfg" | jq -r '(.runners // {}) | to_entries[] | .value.kind // empty' 2>/dev/null | sort -u || true)"
+  default_runner="$(printf '%s' "$cfg" | jq -r '.default // empty' 2>/dev/null || true)"
+
+  local init_missing=""
+  [ -f "$project/.claude/commands/opsx/apply.md" ] || init_missing="$init_missing claude"
+  ls "$project"/.opencode/commands/opsx-*.md >/dev/null 2>&1 || init_missing="$init_missing opencode"
+  if [ -z "$init_missing" ]; then
+    doctor_add project_init ok ""
+  elif [ "$fix" -eq 1 ] && command -v openspec >/dev/null 2>&1 \
+       && (cd "$project" && openspec init --tools claude,opencode >/dev/null 2>&1); then
+    log "doctor --fix: ran 'openspec init --tools claude,opencode' in $project"
+    doctor_add project_init ok ""
+  else
+    doctor_add project_init warn "run 'openspec init --tools claude,opencode' in $project"
+  fi
+
+  local status_out bad_kinds="" bad_runner=""
+  if [ "$have_herdr" -eq 1 ] && [ -n "$kinds" ]; then
+    status_out="$(herdr integration status 2>/dev/null || true)"
+    for k in $kinds; do
+      iname="$k"
+      [ "$k" = "gemini" ] && iname="antigravity-cli"
+      printf '%s\n' "$status_out" | grep -q "^$iname: current" || bad_kinds="$bad_kinds $k"
+    done
+  fi
+  if [ -z "$bad_kinds" ]; then
+    doctor_add herdr_integration ok ""
+  else
+    doctor_add herdr_integration fail "run 'herdr integration install <kind>' for:$bad_kinds"
+  fi
+
+  for k in $kinds; do
+    command -v "$k" >/dev/null 2>&1 || bad_runner="$bad_runner $k"
+  done
+  if [ -z "$bad_runner" ]; then
+    doctor_add runner_path ok ""
+  else
+    doctor_add runner_path fail "put the runner on PATH:$bad_runner"
+  fi
+
+  if [ "$have_herdr" -eq 1 ]; then
+    if [ -n "$(find_workspace_for_repo "$project" 2>/dev/null || true)" ]; then
+      doctor_add workspace ok ""
+    else
+      doctor_add workspace warn "no Herdr workspace for $project yet; dispatch will create one"
+    fi
+  else
+    doctor_add workspace warn "cannot check the workspace without herdr"
+  fi
+
+  local test_cmd
+  test_cmd="$(config_test_command "$project" 2>/dev/null || true)"
+  [ -n "$test_cmd" ] || test_cmd="$(detect_test_command "$project" 2>/dev/null || true)"
+  if [ -n "$test_cmd" ]; then
+    doctor_add test_command ok ""
+  else
+    doctor_add test_command warn "no test command recognized; the review will report not_run"
+  fi
+
+  if is_project_registered "$project"; then
+    doctor_add project_registry ok ""
+  elif [ "$fix" -eq 1 ] && doctor_register_project "$project" "$(basename "$project")"; then
+    log "doctor --fix: registered '$project' as '$(basename "$project")'"
+    doctor_add project_registry ok ""
+  else
+    doctor_add project_registry warn "add '$project' under [projects] in $BOSS_CONFIG"
+  fi
+
+  local jdir ldir mdir
+  jdir="$(dirname "$(journal_project_path "$project" 2>/dev/null)")"
+  ldir="$(dirname "$(lessons_project_path "$project" 2>/dev/null)")"
+  mdir="$(missions_dir "$project" 2>/dev/null || true)"
+  [ "$fix" -eq 1 ] && mkdir -p "$jdir" "$ldir" "$mdir" 2>/dev/null || true
+  if [ -d "$jdir" ] && [ -d "$ldir" ] && { [ -z "$mdir" ] || [ -d "$mdir" ]; }; then
+    doctor_add write_access ok ""
+  else
+    doctor_add write_access warn "run 'boss doctor --fix' to create the journal/lessons/missions directories"
+  fi
+
+  if printf '%s' "${OPENCODE_CONFIG_CONTENT:-}" | grep -q '"allow"'; then
+    doctor_add boss_permission ok ""
+  else
+    doctor_add boss_permission warn "start the boss via 'boss session' so its tab carries the allow scope"
+  fi
+
+  local checks overall json
+  checks="$(jq -s '.' "$DOCTOR_TMP")"
+  rm -f "$DOCTOR_TMP"
+
+  if [ "$(printf '%s' "$checks" | jq '[.[] | select(.status == "fail")] | length')" -gt 0 ]; then
+    overall="fail"
+  elif [ "$(printf '%s' "$checks" | jq '[.[] | select(.status == "warn")] | length')" -gt 0 ]; then
+    overall="warn"
+  else
+    overall="ok"
+  fi
+
+  json="$(jq -nc --arg project "$project" --arg status "$overall" --argjson checks "$checks" \
+    '{project: $project, status: $status, checks: $checks}')"
+
+  if [ "$want_json" -eq 1 ]; then
+    printf '%s\n' "$json"
+    return 0
+  fi
+  printf 'project: %s\n' "$project"
+  printf '%s' "$checks" | jq -r '.[] | "\(.id): \(.status)" + (if .hint then " -- \(.hint)" else "" end)'
+  printf 'overall: %s\n' "$overall"
+  printf '%s\n' "$json"
+  return 0
 }
 
 # --------------------------------------------------------------- retrigger ---
@@ -1679,6 +2034,8 @@ cmd_finish() {
     || log "warning: could not record cycle event"
 
   rm -f "$state_file"
+  # The apply is gone: drop its pending wake items with it.
+  inbox_remove "$project" "$change"
 
   # The verified lesson of the run is written only here, never by the apply
   # agent. A write error is reported but must not block the finish.
@@ -1839,31 +2196,169 @@ mission_file_for() {
   printf '%s/%s.md\n' "$(missions_dir "$1")" "$2"
 }
 
-# mission_parse <file> -- compact JSON {goal, changes:[...]} for a mission doc.
-# List items ('- <change>', optionally indented) are the ordered changes; the
-# remaining prose (headings skipped) is the goal. Returns 1 when the file does
-# not exist.
+# mission_parse <file> -- compact JSON {goal, changes:[...], backlog:[...]} for a
+# mission doc. Section-aware: only bullets under '## Changes' are changes and
+# only bullets under '## Backlog' are backlog; the goal is read only from
+# '## Goal'/'## Brief'. A doc that carries none of these headings keeps the old
+# behavior (every bullet is a change, the remaining prose is the goal), so
+# existing missions still parse. Returns 1 when the file does not exist.
 mission_parse() {
-  local file="$1" line item goal="" goal_line
+  local file="$1" line item txt section="" recognized=0
   [ -f "$file" ] || return 1
-  local -a changes=()
+  local -a changes=() backlog=() legacy_changes=()
+  local goal="" legacy_goal=""
   while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^[[:space:]]*##[[:space:]]+(Goal|Brief|Changes|Backlog)[[:space:]]*$ ]]; then
+      recognized=1
+      case "${BASH_REMATCH[1]}" in
+        Goal|Brief) section="goal" ;;
+        Changes) section="changes" ;;
+        Backlog) section="backlog" ;;
+      esac
+      continue
+    fi
+    if [[ "$line" =~ ^[[:space:]]*#+[[:space:]] ]]; then
+      section="other"
+      continue
+    fi
     if [[ "$line" =~ ^[[:space:]]*-[[:space:]]+(.+)$ ]]; then
       item="${BASH_REMATCH[1]}"
       item="${item%"${item##*[![:space:]]}"}"
-      [ -n "$item" ] && changes+=("$item")
-    elif [[ "$line" =~ ^[[:space:]]*# ]]; then
-      :
-    else
-      goal_line="${line#"${line%%[![:space:]]*}"}"
-      goal_line="${goal_line%"${goal_line##*[![:space:]]}"}"
-      [ -n "$goal_line" ] && goal="$goal $goal_line"
+      [ -n "$item" ] || continue
+      legacy_changes+=("$item")
+      case "$section" in
+        changes) changes+=("$item") ;;
+        backlog) backlog+=("$item") ;;
+      esac
+      continue
     fi
+    txt="${line#"${line%%[![:space:]]*}"}"
+    txt="${txt%"${txt##*[![:space:]]}"}"
+    [ -n "$txt" ] || continue
+    [ "$section" = "goal" ] && goal="$goal $txt"
+    legacy_goal="$legacy_goal $txt"
   done <"$file"
-  goal="${goal# }"
-  local changes_json="[]"
+
+  if [ "$recognized" -eq 0 ]; then
+    goal="${legacy_goal# }"
+    if [ "${#legacy_changes[@]}" -gt 0 ]; then changes=("${legacy_changes[@]}"); fi
+  else
+    goal="${goal# }"
+  fi
+
+  local changes_json="[]" backlog_json="[]"
   [ "${#changes[@]}" -gt 0 ] && changes_json="$(printf '%s\n' "${changes[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
-  jq -nc --arg goal "$goal" --argjson changes "$changes_json" '{goal: $goal, changes: $changes}'
+  [ "${#backlog[@]}" -gt 0 ] && backlog_json="$(printf '%s\n' "${backlog[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  jq -nc --arg goal "$goal" --argjson changes "$changes_json" --argjson backlog "$backlog_json" \
+    '{goal: $goal, changes: $changes, backlog: $backlog}'
+}
+
+# mission_setting <file> <key> <default> -- the value of a 'key: value' line in
+# the mission doc (first match), or <default>.
+mission_setting() {
+  local file="$1" key="$2" default="$3" line val=""
+  if [ -f "$file" ]; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^[[:space:]]*$key[[:space:]]*:[[:space:]]*(.+)$ ]]; then
+        val="${BASH_REMATCH[1]}"
+        val="${val%"${val##*[![:space:]]}"}"
+        break
+      fi
+    done <"$file"
+  fi
+  [ -n "$val" ] || val="$default"
+  printf '%s\n' "$val"
+}
+
+# mission_charter_state <file> -- compact JSON {gate, open_questions,
+# undecided_authorization}. 'charter_open' while any '- [ ]' question remains
+# under '## Open Questions' or any Authorization table row has an empty decision
+# cell; 'open' otherwise (also for a missing or legacy doc).
+mission_charter_state() {
+  local file="$1" line section="" open_q=0 undecided=0 cell
+  if [ -f "$file" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      if [[ "$line" =~ ^[[:space:]]*##[[:space:]]+(Open[[:space:]]+Questions|Authorization)[[:space:]]*$ ]]; then
+        case "${BASH_REMATCH[1]}" in
+          "Open Questions") section="questions" ;;
+          "Authorization") section="auth" ;;
+        esac
+        continue
+      fi
+      if [[ "$line" =~ ^[[:space:]]*#+[[:space:]] ]]; then
+        section=""
+        continue
+      fi
+      case "$section" in
+        questions)
+          [[ "$line" =~ ^[[:space:]]*-[[:space:]]*\[[[:space:]]\] ]] && open_q=$(( open_q + 1 ))
+          ;;
+        auth)
+          if [[ "$line" =~ ^[[:space:]]*\| ]]; then
+            cell="$(printf '%s' "$line" | awk -F'|' '{v=$3; gsub(/^[ \t]+/,"",v); gsub(/[ \t]+$/,"",v); print v}')"
+            if [ "$cell" != "Decision" ] && ! printf '%s' "$cell" | grep -qE '^-+$'; then
+              [ -n "$cell" ] || undecided=$(( undecided + 1 ))
+            fi
+          fi
+          ;;
+      esac
+    done <"$file"
+  fi
+  local gate="open"
+  [ "$open_q" -gt 0 ] && gate="charter_open"
+  [ "$undecided" -gt 0 ] && gate="charter_open"
+  jq -nc --arg gate "$gate" --argjson oq "$open_q" --argjson u "$undecided" \
+    '{gate: $gate, open_questions: $oq, undecided_authorization: $u}'
+}
+
+# mission_add_change <file> <change> -- append '- <change>' under '## Changes'
+# (creating the section if needed), atomically and without duplicating an
+# existing entry. Returns 1 on a write error.
+mission_add_change() {
+  local file="$1" change="$2" tmp
+  [ -f "$file" ] || return 1
+  tmp="$(mktemp "${file}.XXXXXX" 2>/dev/null)" || return 1
+  if awk -v change="$change" '
+      /^## Changes[[:space:]]*$/ { in_changes = 1; print; next }
+      in_changes && /^## / { if (!inserted && !seen) { printf "- %s\n", change; inserted = 1 } in_changes = 0 }
+      in_changes && /^[[:space:]]*-[[:space:]]+/ {
+        t = $0; sub(/^[[:space:]]*-[[:space:]]+/, "", t); sub(/[[:space:]]+$/, "", t)
+        if (t == change) seen = 1
+        print; next
+      }
+      { print }
+      END {
+        if (in_changes && !inserted && !seen) { printf "- %s\n", change; inserted = 1 }
+        if (!inserted && !seen) { printf "\n## Changes\n- %s\n", change }
+      }
+    ' "$file" >"$tmp"; then
+    mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# mission_remove_change <file> <change> -- remove the '- <change>' line under
+# '## Changes', atomically. Returns 1 on a write error.
+mission_remove_change() {
+  local file="$1" change="$2" tmp
+  [ -f "$file" ] || return 1
+  tmp="$(mktemp "${file}.XXXXXX" 2>/dev/null)" || return 1
+  if awk -v change="$change" '
+      /^## Changes[[:space:]]*$/ { in_changes = 1; print; next }
+      in_changes && /^## / { in_changes = 0 }
+      in_changes && /^[[:space:]]*-[[:space:]]+/ {
+        t = $0; sub(/^[[:space:]]*-[[:space:]]+/, "", t); sub(/[[:space:]]+$/, "", t)
+        if (t == change) next
+      }
+      { print }
+    ' "$file" >"$tmp"; then
+    mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
 }
 
 # cmd_mission_start <slug> <project-name> -- create the mission doc if missing
@@ -1876,8 +2371,40 @@ cmd_mission_start() {
   file="$dir/$slug.md"
   if [ ! -f "$file" ]; then
     mkdir -p "$dir" || die_json "mission_write" "cannot create missions dir: $dir"
-    printf '# Mission: %s\n\n## Goal\n\nDescribe the goal of this mission: what should exist when it is done.\n\n## Changes\n\n' "$slug" >"$file" \
-      || die_json "mission_write" "cannot write mission file: $file"
+    cat >"$file" <<EOF || die_json "mission_write" "cannot write mission file: $file"
+# Mission: $slug
+
+## Goal
+
+Describe the goal of this mission: what should exist when it is done.
+
+## Non-Goals
+
+## Constraints
+
+## Authorization
+
+| Category | Decision | Bound |
+| --- | --- | --- |
+| Remote push |  |  |
+| Spending / API cost |  |  |
+| sudo / root |  |  |
+| Data deletion |  |  |
+| External network / SSH |  |  |
+| History rewrite / force-push |  |  |
+
+## Stop Conditions
+
+## Open Questions
+
+## Plan
+
+planning: planned
+reconcile: explore
+
+## Changes
+
+EOF
     created=true
   fi
   printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg path "$file" \
@@ -1885,7 +2412,8 @@ cmd_mission_start() {
     '{slug: $slug, project: $project, path: $path, status: (if $created then "created" else "exists" end)}')"
 }
 
-# cmd_mission_status <slug> <project-name> -- goal and derived per-change state
+# cmd_mission_status <slug> <project-name> -- goal, charter, planning mode and
+# derived per-change state
 cmd_mission_status() {
   local slug="$1" project_name="$2"
   ensure_config
@@ -1894,17 +2422,22 @@ cmd_mission_status() {
   file="$(mission_file_for "$project" "$slug")"
   if [ ! -f "$file" ]; then
     printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg path "$file" \
-      '{slug: $slug, project: $project, path: $path, status: "mission_missing", goal: null, changes: [], progress: {total: 0, done: 0}}')"
+      '{slug: $slug, project: $project, path: $path, status: "mission_missing", goal: null, charter: {gate: "open", open_questions: 0, undecided_authorization: 0}, planning: "planned", reconcile: "explore", changes: [], backlog: [], progress: {total: 0, done: 0}}')"
     return 0
   fi
-  local parsed goal
+  local parsed goal backlog_json charter planning reconcile
   parsed="$(mission_parse "$file")" || die_json "mission_invalid" "cannot parse mission file $file"
   goal="$(printf '%s' "$parsed" | jq -r '.goal')"
+  backlog_json="$(printf '%s' "$parsed" | jq -c '.backlog')"
+  charter="$(mission_charter_state "$file")"
+  planning="$(mission_setting "$file" planning planned)"
+  reconcile="$(mission_setting "$file" reconcile explore)"
   local -a changes=()
   while IFS= read -r c; do [ -n "$c" ] && changes+=("$c"); done < <(printf '%s' "$parsed" | jq -r '.changes[]')
   if [ "${#changes[@]}" -eq 0 ]; then
     printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg path "$file" --arg goal "$goal" \
-      '{slug: $slug, project: $project, path: $path, status: "no_changes", goal: (if $goal == "" then null else $goal end), changes: [], progress: {total: 0, done: 0}}')"
+      --argjson charter "$charter" --arg planning "$planning" --arg reconcile "$reconcile" --argjson backlog "$backlog_json" \
+      '{slug: $slug, project: $project, path: $path, status: "no_changes", goal: (if $goal == "" then null else $goal end), charter: $charter, planning: $planning, reconcile: $reconcile, changes: [], backlog: $backlog, progress: {total: 0, done: 0}}')"
     return 0
   fi
   local json="[]" c st done_count=0
@@ -1914,8 +2447,9 @@ cmd_mission_status() {
     [ "$(printf '%s' "$st" | jq -r '.state')" = "done" ] && done_count=$((done_count + 1))
   done
   printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg path "$file" --arg goal "$goal" \
-    --argjson changes "$json" --argjson done "$done_count" \
-    '{slug: $slug, project: $project, path: $path, status: "ok", goal: (if $goal == "" then null else $goal end), changes: $changes, progress: {total: ($changes | length), done: $done}}')"
+    --argjson charter "$charter" --arg planning "$planning" --arg reconcile "$reconcile" \
+    --argjson changes "$json" --argjson backlog "$backlog_json" --argjson done "$done_count" \
+    '{slug: $slug, project: $project, path: $path, status: "ok", goal: (if $goal == "" then null else $goal end), charter: $charter, planning: $planning, reconcile: $reconcile, changes: $changes, backlog: $backlog, progress: {total: ($changes | length), done: $done}}')"
 }
 
 # cmd_mission_next <slug> <project-name> -- dispatch the first change not done
@@ -1927,11 +2461,25 @@ cmd_mission_next() {
   project="$(resolve_project "$project_name")" || exit 1
   file="$(mission_file_for "$project" "$slug")"
   [ -f "$file" ] || die_json "mission_missing" "mission '$slug' not found at $file; create it with 'boss mission start $slug --project <name|path>'"
-  local parsed
+
+  # The charter gate: nothing is dispatched while a question or an
+  # authorization row is still open.
+  local charter
+  charter="$(mission_charter_state "$file")"
+  if [ "$(printf '%s' "$charter" | jq -r '.gate')" != "open" ]; then
+    die_json "charter_open" "mission '$slug' has an open charter ($(printf '%s' "$charter" | jq -r '"\(.open_questions) open question(s), \(.undecided_authorization) undecided authorization row(s)"')); resolve the charter before dispatching"
+  fi
+
+  local parsed planning
   parsed="$(mission_parse "$file")" || die_json "mission_invalid" "cannot parse mission file $file"
-  local -a changes=()
-  while IFS= read -r c; do [ -n "$c" ] && changes+=("$c"); done < <(printf '%s' "$parsed" | jq -r '.changes[]')
-  [ "${#changes[@]}" -gt 0 ] || die_json "mission_empty" "mission '$slug' names no changes in $file"
+  planning="$(mission_setting "$file" planning planned)"
+  local -a candidates=()
+  while IFS= read -r c; do [ -n "$c" ] && candidates+=("$c"); done < <(printf '%s' "$parsed" | jq -r '.changes[]')
+  # In rolling mode the backlog is a second source of candidates.
+  if [ "$planning" = "rolling" ]; then
+    while IFS= read -r c; do [ -n "$c" ] && candidates+=("$c"); done < <(printf '%s' "$parsed" | jq -r '.backlog[]')
+  fi
+  [ "${#candidates[@]}" -gt 0 ] || die_json "mission_empty" "mission '$slug' names no changes in $file"
 
   # One executer per workspace: refuse before choosing, so a running executer is
   # reported even when the next change is not ready yet.
@@ -1942,12 +2490,13 @@ cmd_mission_next() {
   local runner
   runner="$(resolve_runner "")" || exit 1
 
-  local c st target="" target_state=""
-  for c in "${changes[@]}"; do
+  local c st target="" target_state="" target_st=""
+  for c in "${candidates[@]}"; do
     st="$(mission_done_state "$project" "$c")"
     if [ "$(printf '%s' "$st" | jq -r '.state')" != "done" ]; then
       target="$c"
       target_state="$(printf '%s' "$st" | jq -r '.state')"
+      target_st="$st"
       break
     fi
   done
@@ -1959,16 +2508,46 @@ cmd_mission_next() {
   fi
 
   if [ "$target_state" = "change_not_ready" ]; then
-    die_json "change_not_ready" "change '$target' in $project has no proposal yet; create it before 'boss mission next' can dispatch it"
+    die_json "change_not_ready" "change '$target' in $project has no proposal yet; create it before 'boss mission next' can dispatch it (missing artifact: proposal)"
+  fi
+
+  if [ "$(printf '%s' "$target_st" | jq -r '.ready')" = "false" ]; then
+    die_json "change_not_ready" "change '$target' in $project is missing artifacts: $(printf '%s' "$target_st" | jq -r '(.missing_artifacts // []) | join(", ")'); create them before 'boss mission next' can dispatch it"
   fi
 
   dispatch_change "$target" "$project" "$runner" ""
 }
 
+# cmd_mission_add <slug> <change> <project-name> -- append a change to the mission
+cmd_mission_add() {
+  local slug="$1" change="$2" project_name="$3"
+  ensure_config
+  local project file
+  project="$(resolve_project "$project_name")" || exit 1
+  file="$(mission_file_for "$project" "$slug")"
+  [ -f "$file" ] || die_json "mission_missing" "mission '$slug' not found at $file"
+  mission_add_change "$file" "$change" || die_json "mission_write" "cannot update mission file $file"
+  printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg path "$file" --arg change "$change" \
+    '{slug: $slug, project: $project, path: $path, change: $change, status: "added"}')"
+}
+
+# cmd_mission_rm <slug> <change> <project-name> -- remove a change from the mission
+cmd_mission_rm() {
+  local slug="$1" change="$2" project_name="$3"
+  ensure_config
+  local project file
+  project="$(resolve_project "$project_name")" || exit 1
+  file="$(mission_file_for "$project" "$slug")"
+  [ -f "$file" ] || die_json "mission_missing" "mission '$slug' not found at $file"
+  mission_remove_change "$file" "$change" || die_json "mission_write" "cannot update mission file $file"
+  printf '%s\n' "$(jq -n --arg slug "$slug" --arg project "$project" --arg path "$file" --arg change "$change" \
+    '{slug: $slug, project: $project, path: $path, change: $change, status: "removed"}')"
+}
+
 # cmd_mission <action> <slug> [--project <name|path>] -- dispatch the mission
 # subcommands and reject a slug that would escape the missions directory.
 cmd_mission() {
-  local action="" slug="" project_name="" arg
+  local action="" slug="" change="" project_name="" arg
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
@@ -1978,10 +2557,11 @@ cmd_mission() {
       *)
         if [ -z "$action" ]; then action="$arg"
         elif [ -z "$slug" ]; then slug="$arg"
+        elif [ -z "$change" ]; then change="$arg"
         else usage_error "unexpected argument: $arg"; fi ;;
     esac
   done
-  [ -n "$action" ] || usage_error "usage: boss mission start|status|next <slug> [--project <name|path>]"
+  [ -n "$action" ] || usage_error "usage: boss mission start|status|next|add|rm <slug> [<change>] [--project <name|path>]"
   [ -n "$slug" ] || usage_error "usage: boss mission $action <slug> [--project <name|path>]"
   case "$slug" in
     */*|*..*) usage_error "invalid mission slug: $slug" ;;
@@ -1990,8 +2570,100 @@ cmd_mission() {
     start) cmd_mission_start "$slug" "$project_name" ;;
     status) cmd_mission_status "$slug" "$project_name" ;;
     next) cmd_mission_next "$slug" "$project_name" ;;
+    add)
+      [ -n "$change" ] || usage_error "usage: boss mission add <slug> <change> [--project <name|path>]"
+      cmd_mission_add "$slug" "$change" "$project_name" ;;
+    rm)
+      [ -n "$change" ] || usage_error "usage: boss mission rm <slug> <change> [--project <name|path>]"
+      cmd_mission_rm "$slug" "$change" "$project_name" ;;
     *) usage_error "unknown mission action: $action" ;;
   esac
+}
+
+# --------------------------------------------------------------- reconcile ---
+
+# cmd_reconcile <slug> [--project <name|path>] [--json] -- read-only context for
+# the post-apply reconciliation: charter state, remaining changes, backlog, open
+# inbox items and the journal tail.
+cmd_reconcile() {
+  ensure_config
+  local slug="" project_name="" want_json=0 arg
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --project) project_name="${1:-}"; shift ;;
+      --json) want_json=1 ;;
+      -h|--help) usage ;;
+      --*) usage_error "unknown option: $arg" ;;
+      *) if [ -z "$slug" ]; then slug="$arg"; else usage_error "unexpected argument: $arg"; fi ;;
+    esac
+  done
+  [ -n "$slug" ] || usage_error "usage: boss reconcile <slug> [--project <name|path>] [--json]"
+  case "$slug" in
+    */*|*..*) usage_error "invalid mission slug: $slug" ;;
+  esac
+
+  local project file
+  project="$(resolve_project "$project_name")" || exit 1
+  file="$(mission_file_for "$project" "$slug")"
+  [ -f "$file" ] || die_json "mission_missing" "mission '$slug' not found at $file"
+
+  local parsed goal charter planning reconcile backlog_json
+  parsed="$(mission_parse "$file")" || die_json "mission_invalid" "cannot parse mission file $file"
+  goal="$(printf '%s' "$parsed" | jq -r '.goal')"
+  backlog_json="$(printf '%s' "$parsed" | jq -c '.backlog')"
+  charter="$(mission_charter_state "$file")"
+  planning="$(mission_setting "$file" planning planned)"
+  reconcile="$(mission_setting "$file" reconcile explore)"
+
+  local changes_json="[]" remaining_json="[]" c st
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    st="$(mission_done_state "$project" "$c")"
+    changes_json="$(printf '%s' "$changes_json" | jq -c --argjson s "$st" '. + [$s]')"
+    if [ "$(printf '%s' "$st" | jq -r '.state')" != "done" ]; then
+      remaining_json="$(printf '%s' "$remaining_json" | jq -c --arg c "$c" '. + [$c]')"
+    fi
+  done < <(printf '%s' "$parsed" | jq -r '.changes[]')
+
+  local inbox_json="[]" f iproject
+  for f in "$BOSS_INBOX_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    iproject="$(jq -r '.project // empty' "$f" 2>/dev/null || true)"
+    [ "$iproject" = "$project" ] || continue
+    inbox_json="$(printf '%s' "$inbox_json" | jq -c --argjson i "$(jq -c '{id, ts, change, state}' "$f")" '. + [$i]')"
+  done
+
+  local jfile journal_json="[]"
+  jfile="$(journal_project_path "$project" 2>/dev/null || true)"
+  if [ -n "$jfile" ] && [ -f "$jfile" ]; then
+    journal_json="$(tail -n 20 "$jfile" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  fi
+
+  local json
+  json="$(jq -n --arg slug "$slug" --arg project "$project" --arg path "$file" --arg goal "$goal" \
+    --argjson charter "$charter" --arg planning "$planning" --arg reconcile "$reconcile" \
+    --argjson changes "$changes_json" --argjson remaining "$remaining_json" --argjson backlog "$backlog_json" \
+    --argjson inbox "$inbox_json" --argjson journal "$journal_json" \
+    '{slug: $slug, project: $project, path: $path, goal: (if $goal == "" then null else $goal end),
+      charter: $charter, planning: $planning, reconcile: $reconcile,
+      changes: $changes, remaining: $remaining, backlog: $backlog,
+      inbox: $inbox, journal_tail: $journal}')"
+
+  if [ "$want_json" -eq 1 ]; then
+    printf '%s\n' "$json"
+    return 0
+  fi
+  printf 'mission: %s (%s)\n' "$slug" "$project"
+  printf 'charter: %s -- %s open question(s), %s undecided authorization row(s)\n' \
+    "$(printf '%s' "$charter" | jq -r '.gate')" \
+    "$(printf '%s' "$charter" | jq -r '.open_questions')" \
+    "$(printf '%s' "$charter" | jq -r '.undecided_authorization')"
+  printf 'planning: %s, reconcile: %s\n' "$planning" "$reconcile"
+  printf 'remaining: %s\n' "$(printf '%s' "$remaining_json" | jq -r 'if length == 0 then "(none)" else join(", ") end')"
+  printf 'inbox: %s open item(s)\n' "$(printf '%s' "$inbox_json" | jq -r 'length')"
+  printf '%s\n' "$json"
+  return 0
 }
 
 # -------------------------------------------------------------------- main ---
@@ -2004,6 +2676,9 @@ main() {
     status) shift; cmd_status "$@" ;;
     review) shift; cmd_review "$@" ;;
     wait) shift; cmd_wait "$@" ;;
+    inbox) shift; cmd_inbox "$@" ;;
+    journal) shift; cmd_journal "$@" ;;
+    doctor) shift; cmd_doctor "$@" ;;
     retrigger) shift; cmd_retrigger "$@" ;;
     finish) shift; cmd_finish "$@" ;;
     answer) shift; cmd_answer "$@" ;;
@@ -2011,6 +2686,7 @@ main() {
     claim) shift; cmd_claim "$@" ;;
     session) shift; cmd_session "$@" ;;
     mission) shift; cmd_mission "$@" ;;
+    reconcile) shift; cmd_reconcile "$@" ;;
     -h|--help) usage ;;
     "") usage ;;
     *) usage_error "unknown command: ${1:-}" ;;

@@ -11,6 +11,7 @@ BOSS_APPLIES_DIR="$BOSS_STATE_DIR/applies"
 BOSS_LOGS_DIR="$BOSS_STATE_DIR/logs"
 BOSS_CYCLES_DIR="$BOSS_STATE_DIR/cycles"
 BOSS_BOSSES_DIR="$BOSS_STATE_DIR/bosses"
+BOSS_INBOX_DIR="$BOSS_STATE_DIR/inbox"
 
 # cpu_count -- number of online CPUs, or 1 when it cannot be determined.
 cpu_count() {
@@ -46,6 +47,9 @@ BOSS_LOADAVG_FILE="${BOSS_LOADAVG_FILE:-/proc/loadavg}"
 # active lesson lines and this many characters, taken global-first.
 BOSS_LESSONS_MAX="${BOSS_LESSONS_MAX:-20}"
 BOSS_LESSONS_MAX_CHARS="${BOSS_LESSONS_MAX_CHARS:-2000}"
+# How many retriggers the Explorer allows a change before it gives up on it and
+# turns the remaining work into a follow-up change (see the skill).
+BOSS_MAX_RETRIGGERS="${BOSS_MAX_RETRIGGERS:-3}"
 
 # Appended to every apply prompt unless the runner overrides or disables it:
 # the apply must end its turn, the boss is woken by the waiter and retriggers.
@@ -147,18 +151,25 @@ normalize_name() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9_-]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//'
 }
 
-# sha1_hex <text> -- lowercase hex SHA1 of <text>. Prefers GNU 'sha1sum' and
-# falls back to BSD/macOS 'shasum -a 1' (macOS has no sha1sum), so no extra
-# package is needed. Prints nothing when neither tool exists.
+# sha1_hex <text> -- lowercase hex SHA1 of <text>. Tries GNU 'sha1sum', then
+# BSD/macOS 'shasum -a 1', then 'python3' (hashlib) and 'openssl dgst -sha1',
+# so no single tool is required. Aborts with a clear error when none exists:
+# an empty hash would collapse the state key and let two projects collide.
 sha1_hex() {
-  local text="${1:-}"
+  local text="${1:-}" h=""
   if command -v sha1sum >/dev/null 2>&1; then
-    printf '%s' "$text" | sha1sum | cut -d' ' -f1
+    h="$(printf '%s' "$text" | sha1sum | cut -d' ' -f1)"
   elif command -v shasum >/dev/null 2>&1; then
-    printf '%s' "$text" | shasum -a 1 | cut -d' ' -f1
-  else
-    return 1
+    h="$(printf '%s' "$text" | shasum -a 1 | cut -d' ' -f1)"
+  elif command -v python3 >/dev/null 2>&1; then
+    h="$(printf '%s' "$text" | python3 -c 'import sys, hashlib; sys.stdout.write(hashlib.sha1(sys.stdin.buffer.read()).hexdigest())' 2>/dev/null || true)"
+  elif command -v openssl >/dev/null 2>&1; then
+    h="$(printf '%s' "$text" | openssl dgst -sha1 | sed 's/^.*= //')"
   fi
+  if [ -z "$h" ]; then
+    die_json "missing_dependency" "no SHA1 tool available (need one of: sha1sum, shasum, python3, openssl)"
+  fi
+  printf '%s' "$h"
 }
 
 # apply_agent_name <change> -- herdr agent name for a change's apply.
@@ -342,21 +353,34 @@ boss_claim_pane() {
 }
 
 # boss_resolve_agent <state-file> -- ordered candidate list of targets for the
-# boss responsible for an apply, one target per line: (1) the boss registered
-# for the apply's workspace -- the real name of its living pane, or the pane id
-# when that pane lost its name, (2) the dispatcher boss recorded in the state,
-# (3) the global BOSS_AGENT_NAME. Dead entries are skipped and targets are
-# deduplicated. Prints nothing when no boss is reachable. Callers try the
-# candidates in order.
+# boss responsible for an apply, one target per line: (1) the dispatcher boss
+# recorded in the state -- its real name, or the recorded pane id when the name
+# was lost, (2) the boss registered for the apply's workspace -- the real name
+# of its living pane, or the pane id when that pane lost its name, (3) the
+# global BOSS_AGENT_NAME. Dead entries are skipped and targets are deduplicated.
+# Prints nothing when no boss is reachable. Callers try the candidates in order.
 boss_resolve_agent() {
-  local state_file="$1" agents ws reg reg_agent reg_pane state_boss target
+  local state_file="$1" agents ws reg reg_pane state_boss state_pane target
   local -a candidates=()
   agents="$(boss_agents)"
+
+  # Stage 1: the boss that dispatched the apply. Prefer its name; fall back to
+  # the pane id recorded at dispatch when the name was lost.
+  state_boss="$(jq -r '.boss // empty' "$state_file" 2>/dev/null || true)"
+  state_pane="$(jq -r '.boss_pane // empty' "$state_file" 2>/dev/null || true)"
+  if [ -n "$state_boss" ] && boss_agent_alive_name "$agents" "$state_boss"; then
+    candidates+=("$state_boss")
+  elif [ -n "$state_pane" ] && boss_agent_alive_pane "$agents" "$state_pane"; then
+    target="$(boss_agent_name_on_pane "$agents" "$state_pane")"
+    [ -n "$target" ] || target="$state_pane"
+    candidates+=("$target")
+  fi
+
+  # Stage 2: the boss registered for the apply's workspace.
   ws="$(jq -r '.workspace_id // empty' "$state_file" 2>/dev/null || true)"
   if [ -n "$ws" ]; then
     reg="$(boss_registry_file_for "$ws")"
     if [ -f "$reg" ]; then
-      reg_agent="$(jq -r '.agent // empty' "$reg" 2>/dev/null || true)"
       reg_pane="$(jq -r '.pane_id // empty' "$reg" 2>/dev/null || true)"
       if [ -n "$reg_pane" ] && boss_agent_alive_pane "$agents" "$reg_pane"; then
         # The registry name is only a wish; the pane's real name (or its id)
@@ -367,13 +391,12 @@ boss_resolve_agent() {
       fi
     fi
   fi
-  state_boss="$(jq -r '.boss // empty' "$state_file" 2>/dev/null || true)"
-  if [ -n "$state_boss" ] && boss_agent_alive_name "$agents" "$state_boss"; then
-    candidates+=("$state_boss")
-  fi
+
+  # Stage 3: the global boss agent.
   if [ -n "${BOSS_AGENT_NAME:-}" ] && boss_agent_alive_name "$agents" "$BOSS_AGENT_NAME"; then
     candidates+=("$BOSS_AGENT_NAME")
   fi
+
   # bash 3.2 (macOS /bin/bash) treats an empty array expansion under set -u
   # as unbound, so leave early when there is no candidate.
   [ "${#candidates[@]}" -gt 0 ] || return 0
@@ -501,6 +524,37 @@ lesson_append() {
   return 0
 }
 
+# journal_append <file> <text> [<tag>] -- append a dated entry to the project's
+# journal under '## Log', creating the file and the section as needed. The
+# entry is '- <iso> [<tag>] <text>'; an existing log is never reordered, the
+# new entry goes last. The write goes through mktemp + mv, so a reader never
+# sees a half-written file.
+journal_append() {
+  local file="$1" text="$2" tag="${3:-}" stamp tmp line
+  [ -n "$file" ] || return 1
+  mkdir -p "$(dirname "$file")" || return 1
+  stamp="$(now_iso)"
+  line="- $stamp"
+  [ -n "$tag" ] && line="$line [$tag]"
+  line="$line $text"
+  tmp="$(mktemp "${file}.XXXXXX" 2>/dev/null)" || return 1
+  if [ ! -f "$file" ]; then
+    printf '## Log\n\n%s\n' "$line" >"$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    awk -v line="$line" '
+      BEGIN { log_seen = 0 }
+      /^## Log[[:space:]]*$/ { log_seen = 1 }
+      { print }
+      END {
+        if (!log_seen) printf "\n## Log\n"
+        printf "\n%s\n", line
+      }
+    ' "$file" >"$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+  return 0
+}
+
 # compose_apply_prompt <apply-cmd> <note> <lessons> <yield> -- the text sent
 # to the apply agent: command, then the note (if any), then the lessons block
 # (if any), then the yield instruction (if any). The yield ends the prompt on
@@ -538,6 +592,86 @@ events_file_for() {
   local project="$1" change="$2" hash
   hash="$(sha1_hex "$project")"
   printf '%s/%s-%s.events.jsonl\n' "$BOSS_CYCLES_DIR" "$hash" "$(normalize_name "$change")"
+}
+
+# --- Inbox: durable wake items -------------------------------------------
+# One JSON file per wake under $BOSS_INBOX_DIR. The waiter writes an item
+# before it prompts, so a lost prompt can be recovered by draining the inbox
+# on any later wake. Files are written atomically (mktemp + mv).
+
+# inbox_write <state-file> <state> -- write one inbox item atomically and print
+# its id (the file name). Fields: id, ts, change, project, state, summary,
+# summary_at, workspace_id, dispatcher, boss_pane. Returns 1 when it cannot
+# write; the caller treats that as non-fatal.
+inbox_write() {
+  local state_file="$1" st="$2" id ts tmp
+  [ -n "$state_file" ] && [ -f "$state_file" ] || return 1
+  mkdir -p "$BOSS_INBOX_DIR" || return 1
+  ts="$(now_iso)"
+  # Sortable and unique: second resolution plus the waiter pid and $RANDOM.
+  id="$(date '+%Y%m%dT%H%M%S')-$$-${RANDOM}.json"
+  tmp="$BOSS_INBOX_DIR/.$id.tmp"
+  if jq --arg id "$id" --arg ts "$ts" --arg st "$st" \
+      '{id: $id, ts: $ts, change: (.change // null), project: (.project // null),
+        state: $st, summary: (.summary // null), summary_at: (.summary_at // null),
+        workspace_id: (.workspace_id // null), dispatcher: (.boss // null),
+        boss_pane: (.boss_pane // null)}' \
+      "$state_file" >"$tmp" 2>/dev/null; then
+    mv "$tmp" "$BOSS_INBOX_DIR/$id" || { rm -f "$tmp"; return 1; }
+    printf '%s\n' "$id"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# inbox_item_path <id> -- path of an inbox item; rejects ids with a path
+# separator so --ack cannot escape the inbox directory.
+inbox_item_path() {
+  local id="${1:-}"
+  case "$id" in
+    ""|*/*|*..*) return 1 ;;
+  esac
+  printf '%s/%s\n' "$BOSS_INBOX_DIR" "$id"
+}
+
+# inbox_remove <project> <change> -- remove every inbox item of an apply.
+# Never fails; used by 'boss finish'.
+inbox_remove() {
+  local project="$1" change="$2" f
+  [ -d "$BOSS_INBOX_DIR" ] || return 0
+  for f in "$BOSS_INBOX_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    if [ "$(jq -r '.project // empty' "$f" 2>/dev/null || true)" = "$project" ] \
+       && [ "$(jq -r '.change // empty' "$f" 2>/dev/null || true)" = "$change" ]; then
+      rm -f "$f"
+    fi
+  done
+  return 0
+}
+
+# inbox_count <project> <change> -- pending inbox items for one apply.
+inbox_count() {
+  local project="$1" change="$2" f n=0
+  [ -d "$BOSS_INBOX_DIR" ] || { printf '0\n'; return 0; }
+  for f in "$BOSS_INBOX_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    if [ "$(jq -r '.project // empty' "$f" 2>/dev/null || true)" = "$project" ] \
+       && [ "$(jq -r '.change // empty' "$f" 2>/dev/null || true)" = "$change" ]; then
+      n=$((n + 1))
+    fi
+  done
+  printf '%s\n' "$n"
+}
+
+# inbox_pending_count -- pending inbox items across all applies.
+inbox_pending_count() {
+  local f n=0
+  [ -d "$BOSS_INBOX_DIR" ] || { printf '0\n'; return 0; }
+  for f in "$BOSS_INBOX_DIR"/*.json; do
+    [ -f "$f" ] && n=$((n + 1))
+  done
+  printf '%s\n' "$n"
 }
 
 # append_event <file> <event> <json-object> -- append one JSONL event line.
@@ -654,10 +788,27 @@ mission_done_state() {
     state="done"
   fi
 
+  # Readiness: which required artifacts are still missing, so 'mission next'
+  # can name them instead of failing only at dispatch. 'design' is optional in
+  # the spec-driven schema (a change may omit design.md), so it is not required
+  # here; proposal/specs/tasks are. An archived or proposal-less change keeps
+  # ready=true; its state already tells the whole story.
+  local ready=true missing_json="[]"
+  if [ "$proposal" = true ] && [ -d "$active_dir" ] && command -v openspec >/dev/null 2>&1; then
+    local st_json
+    st_json="$(cd "$project" && openspec status --change "$change" --json 2>/dev/null || true)"
+    if [ -n "$st_json" ]; then
+      missing_json="$(printf '%s' "$st_json" | jq -c \
+        '[ (.artifacts // [])[] | select((.status != "done") and (.status != "skipped") and (.id != "design")) | .id ]' 2>/dev/null || printf '[]')"
+      [ "$(printf '%s' "$missing_json" | jq 'length')" -gt 0 ] && ready=false
+    fi
+  fi
+
   jq -nc --arg change "$change" --argjson proposal "$proposal" \
     --argjson tasks "$tasks_json" --arg validate "$validate" \
     --argjson finished "$finished" --argjson archived "$archived" --arg state "$state" \
-    '{change: $change, proposal: $proposal, tasks: $tasks, validate: $validate, finished: $finished, archived: $archived, state: $state}'
+    --argjson ready "$ready" --argjson missing "$missing_json" \
+    '{change: $change, proposal: $proposal, tasks: $tasks, validate: $validate, finished: $finished, archived: $archived, state: $state, ready: $ready, missing_artifacts: $missing}'
 }
 
 # expand_home <path> -- expand a leading ~
@@ -810,10 +961,19 @@ resource_warning() {
 
 # waiter_alive <pid> -- 0 when pid is a running boss-waiter. The script runs
 # under bash, so comm= is "bash"; the command line carries the script name.
+# Prefers 'ps'; without it (slim container) it falls back to a live pid plus a
+# matching command line in /proc, so a reused pid is still not accepted.
 waiter_alive() {
-  local pid="$1"
+  local pid="$1" args
   [ -n "$pid" ] && [ "$pid" != "null" ] || return 1
-  ps -p "$pid" -o args= 2>/dev/null | grep -q 'boss-waiter'
+  if command -v ps >/dev/null 2>&1; then
+    ps -p "$pid" -o args= 2>/dev/null | grep -q 'boss-waiter' && return 0
+    return 1
+  fi
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  args="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  printf '%s' "$args" | grep -q 'boss-waiter'
 }
 
 # kill_waiter <pid> -- stop a running waiter, if the pid really is a boss-waiter
@@ -828,14 +988,19 @@ kill_waiter() {
 }
 
 # detach_waiter <state-file> -- start the waiter detached from this process so
-# it survives the dispatch command. Uses setsid (own session) when available
-# and falls back to nohup + background on systems without setsid (macOS).
+# it survives the dispatch command. Uses setsid (own session) when available,
+# then nohup (macOS), and as a last resort a plain background process with a
+# warning (a slim container should run with an init that reaps it).
 # BIN_DIR is set by the caller (bin/boss).
 detach_waiter() {
   local state_file="$1"
   if command -v setsid >/dev/null 2>&1; then
     setsid -f "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1
-  else
+  elif command -v nohup >/dev/null 2>&1; then
     nohup "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1 &
+  else
+    log "warning: neither setsid nor nohup available; starting the waiter as a background process"
+    "$BIN_DIR/boss-waiter" "$state_file" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
   fi
 }

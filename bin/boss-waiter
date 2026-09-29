@@ -119,18 +119,24 @@ wait_for() {
   done
 }
 
-# deliver <text> <state> -- prompt the responsible boss agent. The candidate
-# list (workspace boss, dispatcher, global) is tried in order: an
-# 'agent_not_found' moves on to the next candidate, while a blocked or
-# transient failure retries the same candidate with growing backoff until the
-# overall budget is spent. Only when no candidate could be reached is a Herdr
-# notification shown.
+# deliver <text> <state> -- record the wake durably, then prompt the
+# responsible boss agent. The candidate list (dispatcher, workspace, global) is
+# tried in order: an 'agent_not_found' moves on to the next candidate, while a
+# blocked or transient failure retries the same candidate with growing backoff
+# until the overall budget is spent. Only when no candidate could be reached is
+# a Herdr notification shown.
 deliver() {
   local text="$1" st="$2"
-  local candidates candidate attempt backoff start now out rc code
+  local candidates candidate attempt backoff start now out rc code prompt_text
+  # Durability first: an inbox item survives a lost prompt and is recovered
+  # when the boss drains the inbox on a later wake. Best effort, never fatal.
+  inbox_write "$state_file" "$st" >/dev/null 2>&1 \
+    || log "warning: could not write an inbox item for $change"
+  # Tell the boss to drain the inbox on every wake.
+  printf -v prompt_text '%s\nPending wakeups: run '\''boss inbox'\''.' "$text"
   candidates="$(boss_resolve_agent "$state_file")"
   if [ -z "$candidates" ]; then
-    log "no boss agent reachable (workspace/dispatcher/global); showing a notification instead"
+    log "no boss agent reachable (dispatcher/workspace/global); showing a notification instead"
     herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st" >/dev/null 2>&1 || true
     return 1
   fi
@@ -140,7 +146,11 @@ deliver() {
     attempt=1
     backoff=15
     while true; do
-      out="$(herdr agent prompt "$candidate" "$text" 2>&1)"
+      # Verify the submission took effect: herdr observes a working/blocked
+      # state and reports agent_prompt_stalled when the input did not lead to
+      # it. A boss that is already working matches immediately (the prompt is
+      # queued), so a retry only happens when the prompt visibly did nothing.
+      out="$(herdr agent prompt "$candidate" "$prompt_text" --wait --until working --until blocked --timeout "$BOSS_AGENT_PROMPT_TIMEOUT_MS" 2>&1)"
       rc=$?
       if [ "$rc" -eq 0 ]; then
         log "prompt delivered to agent '$candidate' (state=$st, attempt=$attempt)"
@@ -163,7 +173,7 @@ deliver() {
       backoff=$((backoff * 2))
     done
   done <<<"$candidates"
-  log "no boss candidate reachable (workspace/dispatcher/global); showing a notification instead"
+  log "no boss candidate reachable (dispatcher/workspace/global); showing a notification instead"
   herdr notification show "Boss: apply $change" --body "Apply $change in $project: $st" >/dev/null 2>&1 || true
   return 1
 }
