@@ -41,7 +41,9 @@ log_file="$BOSS_LOGS_DIR/$change-$(date '+%Y%m%dT%H%M%S').log"
 mkdir -p "$BOSS_LOGS_DIR" || exit 1
 BOSS_LOG_FILE="$log_file"
 log "waiter start: change=$change agent=$agent project=$project"
-waiter_start_epoch="$(date +%s)"
+# Start of the current working phase; reset when activity resumes. The stall
+# notice measures from here, not from the waiter start.
+phase_start_epoch="$(date +%s)"
 
 # Record our pid so retrigger/finish can stop us.
 tmp="$(mktemp)"
@@ -69,18 +71,22 @@ trap 'log "waiter terminated"; [ -n "$child_pid" ] && kill "$child_pid" 2>/dev/n
 # report_stall -- tell the boss the apply is still working, without ending it.
 report_stall() {
   local elapsed text
-  elapsed=$(( $(date +%s) - waiter_start_epoch ))
+  elapsed=$(( $(date +%s) - phase_start_epoch ))
   printf -v text 'Apply %s in %s: still working (%ss). No action needed unless you expected it to be done. Next step: boss status %s' \
     "$change" "$project" "$elapsed" "$change"
   log "still working after ${elapsed}s; reporting a stall notice"
   deliver "$text" "working"
 }
 
-# wait_for [<--until STATE>...] -- run 'herdr agent wait' on the apply pane
-# (settled states by default) as an interruptible child. With a stall interval
-# set, a wait that times out means the agent is still working: report it and
-# keep waiting. Only a real failure (the agent is gone) reports 'lost'.
+# wait_for <settled|activity> [<--until STATE>...] -- run 'herdr agent wait' on
+# the apply pane as an interruptible child. In 'settled' mode a wait that times
+# out means the agent is still working: report a stall notice and keep waiting.
+# In 'activity' mode the waiter is waiting for the agent to become active again
+# after a reported state; a timeout is expected (the apply simply stays idle) and
+# is continued silently, with no notice. Only a real failure (the agent is gone)
+# reports 'lost', in either mode.
 wait_for() {
+  local mode="$1"; shift
   local out_file rc out code msg
   while true; do
     out_file="$(mktemp)"
@@ -101,8 +107,12 @@ wait_for() {
     code="$(printf '%s' "$out" | jq -r '.error.code // "wait_failed"' 2>/dev/null || true)"
     case "$code" in
       *timeout*)
-        log "agent wait timed out after ${BOSS_WAITER_STALL_MS}ms"
-        report_stall
+        if [ "$mode" = "settled" ]; then
+          log "agent wait timed out after ${BOSS_WAITER_STALL_MS}ms"
+          report_stall
+        else
+          log "activity wait timed out after ${BOSS_WAITER_STALL_MS}ms; still idle, no notice"
+        fi
         continue
         ;;
     esac
@@ -185,15 +195,17 @@ main() {
     # First round: wait for a settled state. Later rounds: wait for activity
     # after the last report (next_wait), then for the following settled state.
     if [ "${#next_wait[@]}" -gt 0 ]; then
-      wait_for "${next_wait[@]}" || return 0
+      wait_for activity "${next_wait[@]}" || return 0
       out="$(herdr agent get "$agent" 2>&1)" || { log "agent get failed after activity"; continue; }
       st="$(printf '%s' "$out" | jq -r '.result.agent.agent_status // "unknown"')"
       log "activity after report: $st"
       if [ "$st" = "working" ] || [ "$st" = "unknown" ]; then
-        wait_for || return 0
+        # A new working phase begins; the next stall notice counts from here.
+        phase_start_epoch="$(date +%s)"
+        wait_for settled || return 0
       fi
     else
-      wait_for || return 0
+      wait_for settled || return 0
     fi
 
     out="$(herdr agent get "$agent" 2>&1)" || {
