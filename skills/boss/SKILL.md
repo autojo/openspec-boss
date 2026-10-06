@@ -38,7 +38,21 @@ Command (`boss`) and agent name (`apply-<change>`) stay as they are.
    Before the run, preflight the environment with `boss doctor --project <p>`
    (read-only; `--fix` creates missing directories, runs `openspec init` and
    registers the project – nothing else).
-2. **Dispatch** – once all artifacts of the change are ready:
+2. **Clarify** – before the first `boss dispatch` of a new change, or of one
+   whose design changed substantially: ask the human the open design questions
+   and wait for the answers. List the assumptions the plan rests on –
+   thresholds, markups, scope, which data counts, alternatives you discarded –
+   as questions, each with your recommendation, and ask them with your tool's
+   question mechanism (Claude Code `AskUserQuestion`, OpenCode its question
+   tool). Dispatch only after an explicit approval in a separate message from
+   the human. A pure error fix with no open choice (an off-by-one with one
+   obvious solution) needs no question – say in one sentence why nothing is
+   open. A broad delegation ("continue autonomously, deploy to prod") covers
+   review, deploy and retrigger after review findings, but does not replace
+   the questions before the dispatch. A `boss retrigger` that changes the
+   design goes through here again; a retrigger for pure review findings does
+   not.
+3. **Dispatch** – once all artifacts of the change are ready:
    `boss dispatch <change> --project <name|path> [--runner <name>] [--note "<text>"]`.
    In a mission, use `boss mission next <slug> --project <p>` instead of naming
    each change: it picks the first change not yet `done` and dispatches it the
@@ -56,7 +70,7 @@ Command (`boss`) and agent name (`apply-<change>`) stay as they are.
    or poll for a review. An apply that is still `working` thus stays silent –
    if it stays that way longer than `BOSS_WAITER_STALL_MS` (default 45 min), the
    waiter sends you a "still working" notice, no action required.
-3. **Being woken** – the waiter reports completion to you as a prompt, e.g.
+4. **Being woken** – the waiter reports completion to you as a prompt, e.g.
    `Apply add-auth in ~/work/shop: done. Last agent output: … Next step:
    boss status add-auth`; the agent's last output is already attached, you do
    not have to reconstruct it from logs and diffs. If the prompt arrives while
@@ -72,7 +86,7 @@ Command (`boss`) and agent name (`apply-<change>`) stay as they are.
    Every wake is also recorded durably: run `boss inbox` at the start of a wake
    to pick up an earlier wake that was lost, and once per session run
    `boss wait --all` to re-arm waiters orphaned by a restart.
-4. **Review** – `boss review <change> --json` gathers the deterministic
+5. **Review** – `boss review <change> --json` gathers the deterministic
    facts (tasks, `openspec validate`, tests, git) and the friction from the
    event log. Check:
    - `quality.tasks.open == 0`?
@@ -104,13 +118,14 @@ Command (`boss`) and agent name (`apply-<change>`) stay as they are.
      minutes/hours" or "by a human" is not done without that proof;
      hand-written fixtures do not count as "from the archive".
    `boss status <change>` still shows the live agent state and the apply tab.
-5. **Fix** – if the review finds problems: correct proposal/specs in the
+6. **Fix** – if the review finds problems: correct proposal/specs in the
    target project with your tool's update command (Claude Code:
    `/opsx:update <change>`, OpenCode: `/opsx-update <change>`), then
    `boss retrigger <change> [--note "<text>"]` – the apply continues in the
    same agent, the context is kept, and the waiter reports the next
-   completion.
-6. **Finish** – if the review passes: `boss finish <change>` closes the
+   completion. A fix that changes the design, not just the code, goes through
+   **Clarify** (step 2) before the retrigger.
+7. **Finish** – if the review passes: `boss finish <change>` closes the
    apply tab and cleans up; it needs the agent to be settled, nothing else.
    Capture what the review verified, not what the apply agent claimed. A short
    fact that stays relevant goes to a store with `--lesson "<text>"` (and
@@ -134,7 +149,7 @@ Command (`boss`) and agent name (`apply-<change>`) stay as they are.
    OpenCode without) when the change can be archived – that may be before
    or long after `finish`, e.g. when other changes still depend on its spec
    deltas.
-7. **Blocked** – if the completion message is `blocked`: `boss status
+8. **Blocked** – if the completion message is `blocked`: `boss status
    <change>` shows the visible dialog of the apply pane. Decide yourself
    whether to answer (`boss answer <change> <key>…`, e.g. `enter`, `esc`,
    `y`) or to end the apply (`boss finish <change> --force`), journal the
@@ -303,6 +318,8 @@ Follow this fixed table instead of asking (review outcome -> one action):
 
 - You never poll: no repeated `boss status` "to see whether it is done". The
   waiter reports back.
+- Never dispatch first and offer a correction afterwards. A question that comes
+  after the dispatch comes too late.
 - Start every wake with `boss inbox` and, once per session, `boss wait --all`;
   the durable inbox lets a later wake heal an earlier lost one.
 - You never work in the apply tab; `boss answer` is the only exception for
